@@ -54,18 +54,19 @@ import datetime as dt
 import glob
 import json
 import os
+import time
 import zoneinfo
 
 import config
 from modules.data_sources import TradierClient, parse_tradier_chain
 from modules.market_open import classify_from_bars
 from modules.iv_regime import classify as classify_iv
-from modules.econ_calendar import check_event, should_delay_entry, FOMC_DATES_2026, CPI_DATES_2026, PPI_DATES_2026, NFP_DATES_2026
-from modules.news_geopolitical import fetch_headlines, score_risk
+from modules.econ_calendar import check_event, should_delay_entry, load_calendar_dates
+from modules.news_geopolitical import fetch_headlines, score_news_risk
 from modules.strategy_selector import select_structure, build_strikes, Structure
 from modules.option_pricer import expected_move, bs_price
 from modules.position_manager import build_daily_signal
-from modules.tradier_orders import build_entry_legs, submit_multileg_order
+from modules.tradier_orders import build_entry_legs, submit_multileg_order, get_order_status
 from modules.market_structure import build_market_structure
 from modules.vol_structure import build_vol_structure
 from modules.scoring import compute_composite_score
@@ -105,6 +106,43 @@ def count_open_signals_today(today: dt.date) -> int:
         if any(lot.status == LotStatus.OPEN for lot in sig.lots):
             count += 1
     return count
+
+
+def poll_for_fill(client: TradierClient, account_id: str, order_id, fallback_estimate: float) -> tuple[float, bool]:
+    """Polls an order up to config.ORDER_FILL_POLL_ATTEMPTS times,
+    config.ORDER_FILL_POLL_SECONDS apart, for fill confirmation. Returns
+    (credit_per_contract, was_actually_filled). On any failure to
+    confirm a fill within the window -- still pending, rejected, or the
+    status response didn't have the expected shape -- returns
+    `fallback_estimate` (the pre-trade theoretical*haircut estimate) so
+    state/ always has SOME number to work with; the order itself is left
+    alone (NOT cancelled) since duration="day" means it can still fill
+    later even if we stop watching it here."""
+    for attempt in range(config.ORDER_FILL_POLL_ATTEMPTS):
+        try:
+            status = get_order_status(client, account_id, order_id)
+            order = status.get("order", status)
+            state = (order.get("status") or "").lower()
+            if state == "filled":
+                fill = order.get("avg_fill_price")
+                if fill is not None:
+                    return float(fill), True
+                print(f"[warning] order {order_id} shows filled but no avg_fill_price field -- "
+                      f"using pre-trade estimate instead. Raw order object: {order}")
+                return fallback_estimate, False
+            if state in ("rejected", "canceled", "expired"):
+                print(f"[warning] order {order_id} ended as '{state}', not filled -- "
+                      f"using pre-trade estimate for this lot (no position exists for it).")
+                return fallback_estimate, False
+        except Exception as e:  # noqa: BLE001
+            print(f"[warning] polling order {order_id} status failed (attempt {attempt+1}): {e}")
+        if attempt < config.ORDER_FILL_POLL_ATTEMPTS - 1:
+            time.sleep(config.ORDER_FILL_POLL_SECONDS)
+    print(f"[warning] order {order_id} not confirmed filled after "
+          f"{config.ORDER_FILL_POLL_ATTEMPTS * config.ORDER_FILL_POLL_SECONDS}s of polling -- "
+          f"it may still fill later (duration=day); using pre-trade estimate for now. Check "
+          f"Tradier directly and reconcile manually if needed.")
+    return fallback_estimate, False
 
 
 def most_recent_completed_weekday(before: dt.date) -> dt.date:
@@ -186,10 +224,15 @@ def main():
     trend_read = classify_from_bars(spot, max(highs), min(lows), spot, em)
 
     iv_regime = classify_iv(vix)
-    event_flag = check_event(now_et, fomc_dates=FOMC_DATES_2026, cpi_dates=CPI_DATES_2026,
-                              ppi_dates=PPI_DATES_2026, nfp_dates=NFP_DATES_2026)
+    # Prefers data/econ_calendar_cache.json (weekly-refreshed, covers
+    # whichever years refresh_econ_calendar.py has fetched -- see
+    # .github/workflows/calendar_refresh.yml); falls back to econ_calendar.
+    # py's hardcoded 2026-only lists if that cache doesn't exist yet.
+    cal = load_calendar_dates()
+    event_flag = check_event(now_et, fomc_dates=cal["fomc"], cpi_dates=cal["cpi"],
+                              ppi_dates=cal["ppi"], nfp_dates=cal["nfp"])
     headlines = fetch_headlines()
-    news_risk = score_risk(headlines, overnight_futures_gap_pct=0.0, overnight_vix_change_pct=0.0)  # wire real gap/vix-change inputs
+    news_risk = score_news_risk(headlines, overnight_futures_gap_pct=0.0, overnight_vix_change_pct=0.0)  # wire real gap/vix-change inputs
 
     # ---- Market structure / vol structure / composite score, for the Telegram context alert ----
     # Uses effective_date (== today, except in a --dry-run fallback) so the
@@ -256,12 +299,11 @@ def main():
     signal = build_daily_signal(tag, rec.structure.value, strikes,
                                  total_contracts, entry_credit_per_contract)
 
-    entry_msg = f"{dry_tag}[{window['name']}]\n" + telegram_alerts.format_entry_alert(signal)
-
     if args.dry_run:
         # No order, no state file, no pnl_log row -- this run proved the
         # pipeline computes a structure/strikes/sizing end to end; it must
         # never look like (or interfere with) a real signal.
+        entry_msg = f"{dry_tag}[{window['name']}]\n" + telegram_alerts.format_entry_alert(signal)
         telegram_alerts.send(entry_msg)
         print(f"[dry-run][{window['name']}] Would have entered {rec.structure.value} "
               f"(effective_date={effective_date}) -- no order submitted, no state written.")
@@ -273,17 +315,50 @@ def main():
     os.makedirs(STATE_DIR, exist_ok=True)
     state_path = os.path.join(STATE_DIR, f"{tag}.json")
 
+    # BUG HISTORY: the first live order (2026-09-09) used order_type=
+    # "market" -- flagged in tradier_orders.py itself as risky for a
+    # multileg spread's fill quality. Now submits a LIMIT ("credit")
+    # order at config.ENTRY_LIMIT_PRICE_FRACTION of the full theoretical
+    # credit, then polls briefly for a real fill and, if confirmed,
+    # overwrites the lot's pre-trade (haircut-estimated) credit with the
+    # ACTUAL fill price -- so profit targets/stops downstream (position_
+    # manager.py, all keyed off lot.entry_credit_per_contract) are
+    # computed against reality, not a guess, whenever a fill is
+    # confirmed in time. See poll_for_fill()'s docstring for the
+    # fallback behavior when it isn't.
+    limit_price = round(theo_credit * config.ENTRY_LIMIT_PRICE_FRACTION, 2) \
+        if config.ENTRY_ORDER_TYPE != "market" else None
+
     order_results = []
     for lot in signal.lots:
         if lot.contracts <= 0:
             continue
         lot_legs = build_entry_legs(strikes, expiration, contracts=lot.contracts)
-        result = submit_multileg_order(client, account_id, "SPXW", lot_legs, order_type="market")
-        order_results.append({"lot": lot.lot_index, "order": result})
+        result = submit_multileg_order(client, account_id, "SPXW", lot_legs,
+                                        order_type=config.ENTRY_ORDER_TYPE, price=limit_price)
+        order_id = (result.get("order") or {}).get("id")
+
+        filled_credit, was_filled = (lot.entry_credit_per_contract, False)
+        if order_id is not None:
+            filled_credit, was_filled = poll_for_fill(client, account_id, order_id,
+                                                        fallback_estimate=lot.entry_credit_per_contract)
+        else:
+            print(f"[warning] order submission response for lot {lot.lot_index} had no order id -- "
+                  f"can't poll for fill, using pre-trade estimate. Raw response: {result}")
+
+        if was_filled:
+            lot.entry_credit_per_contract = filled_credit
+
+        order_results.append({"lot": lot.lot_index, "order": result,
+                               "limit_price": limit_price, "confirmed_filled": was_filled,
+                               "recorded_entry_credit_per_contract": lot.entry_credit_per_contract})
 
     with open(state_path, "w") as f:
         f.write(signal.to_json())
 
+    # Built AFTER the fill-reconciliation loop above, so it reflects real
+    # confirmed fill prices where we got them, not the pre-trade estimate.
+    entry_msg = f"[{window['name']}]\n" + telegram_alerts.format_entry_alert(signal)
     telegram_alerts.send(entry_msg)
     print(f"[{window['name']}] Entered {rec.structure.value}, state saved to {state_path}")
     print(json.dumps(order_results, indent=2))

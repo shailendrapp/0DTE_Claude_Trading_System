@@ -4,3 +4,6 @@ scipy
 requests
 feedparser
 yfinance
+beautifulsoup4
+lxml
+anthropic

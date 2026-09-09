@@ -546,6 +546,71 @@ week/month) is unaffected either way, since it uses the actual dates
 present in the log. If that ever matters, call `pnl_log.weekly_summary()`/
 `monthly_summary()` directly against the log for the exact range you want.
 
+## 7h. Precision upgrades (2026-09-09): limit orders, live econ calendar, Claude news scoring
+
+Three things added after the first live trade (which used a market order
+and the 2026-only hardcoded calendar):
+
+**Limit orders instead of market orders.** That first live entry used
+`order_type="market"` -- `tradier_orders.py` itself flagged this as risky
+for a 4-leg spread's fill quality, and it was the right thing to fix
+before trusting more real fills. `run_live.py` now submits entries as a
+`"credit"`-type limit order at `config.ENTRY_LIMIT_PRICE_FRACTION` (0.90
+default) of the full theoretical credit, then polls briefly
+(`config.ORDER_FILL_POLL_ATTEMPTS` x `ORDER_FILL_POLL_SECONDS`) for a
+confirmed fill and, if one lands in time, overwrites that lot's recorded
+credit with the REAL fill price rather than the pre-trade estimate --
+everything downstream (profit targets, the ratcheting stop) is keyed off
+that number, so this makes the whole exit chain more accurate whenever a
+fill is confirmed. If it isn't confirmed in time, the order is left
+alone (`duration="day"`, so it can still fill later) and the pre-trade
+estimate is kept as a documented fallback -- never a crash.
+`run_monitor.py`'s exits are split by urgency: a profit-target close is
+discretionary (a limit order, willing to pay up to
+`config.EXIT_LIMIT_PRICE_FRACTION` more than the last mid to still get
+filled promptly) but a stop-loss/strike-test/hard-EOD close stays a
+market order always -- those need certainty of getting out now more than
+they need a good price, and a limit order that fails to fill while the
+position keeps moving is strictly worse than market-order slippage.
+UNTESTED against a real fill confirmation (the `avg_fill_price` field
+name in `get_order_status()` is a documented best guess) -- watch the
+first few real limit-order trades closely.
+
+**Live econ calendar instead of hardcoded 2026 dates.** New
+`modules/econ_calendar_fetch.py` scrapes the Fed's own FOMC calendar page
+and BLS's own release-schedule pages (both publish full-year schedules
+far in advance, no paid calendar needed) and `refresh_econ_calendar.py`
+writes the result to `data/econ_calendar_cache.json`, refreshed weekly by
+`.github/workflows/calendar_refresh.yml` (decoupled from every trading
+run on purpose -- a scraper break here can never delay or corrupt an
+actual entry decision). `econ_calendar.py`'s new `load_calendar_dates()`
+prefers that cache, merged with the original hardcoded 2026 lists, and
+falls back to hardcoded-2026-only if the cache is missing/corrupt.
+**Honesty about this one specifically**: it was written and validated
+against page CONTENT (fetched through a separate tool) in an environment
+with no general internet access of its own, so the actual `requests`/
+`BeautifulSoup` scraping code in `econ_calendar_fetch.py` has never run
+against the live pages. It should work from GitHub Actions (which has
+normal internet access), but run `calendar_refresh.yml` manually once and
+read `data/econ_calendar_cache.json` yourself before trusting it
+unattended -- see that module's docstring for the exact caveats and the
+fail-safe design (a bad scrape leaves the old cache/hardcoded list alone
+rather than writing wrong data).
+
+**Anthropic API key for news/geopolitical scoring.** `news_geopolitical.
+py`'s original keyword scan is still there and still the default -- if
+you add an `ANTHROPIC_API_KEY` repo secret, `score_news_risk()`
+(what `run_live.py` now calls) tries Claude first: it reads the actual
+fetched headlines and judges SPX-relevant risk instead of matching a
+fixed word list, which catches things no keyword list anticipated. Any
+failure (no key, network, bad response) falls straight back to the
+keyword scan -- this is a strict upgrade-if-available, never a new
+failure mode for the entry decision. Optional; the system runs exactly
+as before if you don't add the secret.
+
+Package additions for all three: `beautifulsoup4`, `lxml`, `anthropic`
+(now in `requirements.txt`).
+
 ## 8. Honest next steps
 
 1. Give me real SPX/VIX (and ideally 0DTE options) history, or point me at
@@ -596,7 +661,9 @@ Setup, step by step:
 2. Push this codebase to it (see the chat for the exact git commands).
 3. Repo Settings -> Secrets and variables -> Actions -> New repository
    secret, add all four: `TRADIER_TOKEN`, `TRADIER_SANDBOX_ACCOUNT_ID`,
-   `TELEGRAM_BOT_TOKEN`, `TELEGRAM_CHAT_ID`.
+   `TELEGRAM_BOT_TOKEN`, `TELEGRAM_CHAT_ID`. Optionally also add
+   `ANTHROPIC_API_KEY` (see §7h) for Claude-based news scoring instead of
+   the keyword fallback -- everything works without it.
 4. Repo Settings -> Actions -> General -> Workflow permissions -> "Read
    and write permissions" (needed so the workflows can commit `state/`
    back to the repo; the `permissions: contents: write` block in each
@@ -610,3 +677,21 @@ Setup, step by step:
 6. Once both manual runs succeed (Telegram alerts arrive, `state/`
    changes get committed), the cron schedules take over automatically —
    nothing else to do for tomorrow's session.
+
+### `--dry-run`: testing `run_live.py` outside market hours
+
+A real entry decision needs today's actual intraday bars for that window
+-- if the window hasn't happened yet (e.g. testing at midnight for a
+10:00 ET decision), no real market data source can return it; that's not
+a bug, it would be true of any system wired to a live feed, and Tradier
+correctly rejects the request rather than inventing data. That is a
+separate thing from "can I test this system whenever I want" -- for that,
+`run_live.py --window <name> --dry-run` (also exposed as a checkbox on
+the "0DTE Entry" workflow's manual "Run workflow" button) transparently
+falls back to the most recent completed trading day's data when today's
+window hasn't closed yet, runs the full pipeline against it end to end
+(structure selection, strikes, sizing, both Telegram alerts, clearly
+marked `[DRY RUN]`), and then deliberately stops: no Tradier order is
+submitted, no `state/` file is written, no `pnl_log.csv` row is added.
+It proves the wiring works; it cannot and does not claim to predict what
+today's real numbers will be, since those don't exist yet.

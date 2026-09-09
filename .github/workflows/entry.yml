@@ -76,6 +76,11 @@ jobs:
           TRADIER_SANDBOX_ACCOUNT_ID: ${{ secrets.TRADIER_SANDBOX_ACCOUNT_ID }}
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          # Optional -- news_geopolitical.py falls back to keyword scoring
+          # automatically if this secret isn't set. Add it (Settings ->
+          # Secrets and variables -> Actions) only if you want Claude
+          # reading headlines instead of the keyword list.
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
         # Scheduled (cron) runs are never dry-run -- only workflow_dispatch
         # exposes that input, and only when it's explicitly set to true.
         run: |

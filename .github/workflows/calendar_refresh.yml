@@ -1,0 +1,49 @@
+name: 0DTE Calendar Refresh
+
+# Weekly refresh of data/econ_calendar_cache.json from the Fed's/BLS's
+# published schedules (see modules/econ_calendar_fetch.py + refresh_econ_
+# calendar.py). Decoupled from every trading run on purpose -- a scraper
+# break here can never delay or corrupt a real entry decision; it just
+# means the cache goes stale until this is fixed, and run_live.py falls
+# back to the hardcoded 2026 dates in modules/econ_calendar.py either way.
+#
+# UNTESTED against the live pages from the environment this was built in
+# (no general internet egress there -- see econ_calendar_fetch.py's
+# docstring). Run this manually once (workflow_dispatch) and read the log
+# + the resulting data/econ_calendar_cache.json before trusting the
+# weekly schedule.
+
+on:
+  schedule:
+    - cron: '0 12 * * 0'   # Sunday 12:00 UTC -- well outside any trading window
+  workflow_dispatch: {}
+
+permissions:
+  contents: write
+
+concurrency:
+  group: 0dte-state-writer   # shared with entry.yml/monitor.yml so pushes never race
+  cancel-in-progress: false
+
+jobs:
+  refresh:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Refresh calendar cache
+        run: python refresh_econ_calendar.py
+
+      - name: Commit cache changes
+        run: |
+          git config user.name "0dte-bot"
+          git config user.email "0dte-bot@users.noreply.github.com"
+          git add data/econ_calendar_cache.json
+          git diff --cached --quiet || (git commit -m "econ calendar refresh: $(date -u +%FT%TZ)" && git push)

@@ -84,6 +84,41 @@ MIN_WING_WIDTH = 5.0           # floor so ultra-low-vol days don't get a ~0 wing
 # expirations/strikes this system selects.
 SPX_STRIKE_INCREMENT = 5.0
 
+# ---- Entry order type ----
+# BUG HISTORY: the first live order (2026-09-09) used order_type="market"
+# for a multileg SPX spread, which tradier_orders.py itself flagged as
+# risky for fill quality -- a market order on a 4-leg spread can fill far
+# from theoretical value with no protection. Now submits a LIMIT order
+# (Tradier's "credit" type) priced at this fraction of the theoretical
+# (pre-haircut) net credit -- 0.90 asks for 90% of full theoretical value,
+# a starting point balancing "still likely to fill same-day" against
+# "don't just recreate the market-order slippage by asking for too little
+# up front." Tune this from real fill data as you accumulate it; there's
+# no substitute for that -- this is a guess, like FILL_HAIRCUT.
+ENTRY_ORDER_TYPE = "credit"          # "credit" (limit) or "market" to revert
+ENTRY_LIMIT_PRICE_FRACTION = 0.90
+# After submitting, run_live.py polls for fill confirmation this many
+# times, this many seconds apart, before giving up and falling back to
+# the pre-trade FILL_HAIRCUT-based credit estimate for that lot (the
+# order itself is NOT cancelled if unfilled -- duration="day" means it
+# keeps working; only the RECORDED credit in state/ falls back to an
+# estimate if we didn't see a fill within this window).
+ORDER_FILL_POLL_ATTEMPTS = 6
+ORDER_FILL_POLL_SECONDS = 2
+
+# ---- Exit order type ----
+# Exits are split by URGENCY, not treated uniformly: a profit-target exit
+# is discretionary (we WANT a good price, a slightly-late fill costs
+# little) so it uses a limit ("debit") order, willing to pay up to this
+# fraction MORE than the last-quoted mid debit to still get filled
+# same-poll-cycle. A stop-loss/strike-test/hard-EOD exit is NOT
+# discretionary -- the entire point is getting out now, and a limit order
+# that fails to fill while the position keeps moving against you is
+# strictly worse than a market order's slippage. Those three always stay
+# "market" regardless of this setting; only profit-target exits use it.
+EXIT_LIMIT_ORDER_TYPE = "debit"
+EXIT_LIMIT_PRICE_FRACTION = 1.05
+
 # ---- Position sizing ----
 BASE_CONTRACTS = 1
 SIZE_HALF = 0.5

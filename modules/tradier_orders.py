@@ -120,6 +120,24 @@ def submit_multileg_order(client: TradierClient, account_id: str, underlying: st
     return r.json()
 
 
+def get_order_status(client: TradierClient, account_id: str, order_id) -> dict:
+    """GET /accounts/{account_id}/orders/{order_id} -- used to poll a
+    just-submitted limit order for fill confirmation (see run_live.py's
+    poll_for_fill()). UNTESTED against a live response for the exact
+    field names Tradier uses for a filled multileg order's average price
+    (this assumes `order.avg_fill_price`, per Tradier's documented order
+    object shape) -- if that field is actually named something else or
+    nested differently, poll_for_fill() will just never see it as
+    filled and fall back to the pre-trade credit estimate, which is a
+    safe degrade, not a crash. Confirm the real field name against your
+    own account's response and adjust if needed."""
+    import requests
+    r = requests.get(f"{client.base_url}/accounts/{account_id}/orders/{order_id}",
+                      headers=client._headers(), timeout=10)
+    r.raise_for_status()
+    return r.json()
+
+
 def get_spread_debit_to_close(client: TradierClient, strikes: dict, expiration: dt.date,
                                underlying: str = "SPXW") -> float:
     """Quotes each leg and returns the net debit (per contract) to close the

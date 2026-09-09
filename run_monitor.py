@@ -62,7 +62,16 @@ def process_one(client: TradierClient, account_id: str, state_path: str, now_et:
             continue
 
         exit_legs = build_exit_legs(signal.strikes, expiration, contracts=lot.contracts)
-        submit_multileg_order(client, account_id, "SPXW", exit_legs, order_type="market")
+        # Only a profit-target exit is discretionary enough to risk a
+        # limit order -- stop-loss/strike-test/hard-EOD exits need
+        # certainty of getting out NOW more than they need a good price,
+        # so those three always stay "market" regardless of config.
+        if reason == "profit_target":
+            limit_price = round(debit_to_close * config.EXIT_LIMIT_PRICE_FRACTION, 2)
+            submit_multileg_order(client, account_id, "SPXW", exit_legs,
+                                   order_type=config.EXIT_LIMIT_ORDER_TYPE, price=limit_price)
+        else:
+            submit_multileg_order(client, account_id, "SPXW", exit_legs, order_type="market")
         apply_exit(lot, reason, debit_to_close, now_et)
         any_change = True
 

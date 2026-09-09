@@ -17,6 +17,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import date, datetime, time as dt_time
 from enum import Enum
+import json
+import os
 import config
 
 
@@ -48,6 +50,45 @@ FOMC_DATES_2026 = [date(2026, 1, 28), date(2026, 3, 18), date(2026, 4, 29),
 CPI_DATES_2026 = [date(2026, 9, 11), date(2026, 10, 14), date(2026, 11, 10), date(2026, 12, 10)]
 PPI_DATES_2026 = [date(2026, 9, 10), date(2026, 10, 15), date(2026, 11, 13)]
 NFP_DATES_2026 = [date(2026, 10, 2), date(2026, 11, 6), date(2026, 12, 4)]
+
+CALENDAR_CACHE_PATH = os.path.join("data", "econ_calendar_cache.json")
+
+
+def load_calendar_dates(cache_path: str = CALENDAR_CACHE_PATH) -> dict:
+    """Preferred source of truth for run_live.py: the cache built by
+    refresh_econ_calendar.py (see modules/econ_calendar_fetch.py), which
+    is scraped from the Fed's/BLS's own published schedules on a slow
+    (weekly) cadence and covers whichever years have actually been
+    fetched -- including years beyond 2026, which the hardcoded lists
+    above never will. Falls back to the hardcoded FOMC/CPI/PPI/NFP_DATES_
+    2026 lists (merged in for 2026 specifically) if the cache file
+    doesn't exist yet, is corrupt, or is simply missing a given year --
+    this function never raises; a missing/bad cache degrades to
+    "2026 only, manually maintained" rather than breaking event-risk
+    gating entirely.
+
+    Returns {"fomc": [date,...], "cpi": [...], "ppi": [...], "nfp": [...]}
+    across ALL cached years combined (check_event() only cares whether
+    today's date is IN the list, so a flat multi-year list is fine)."""
+    fomc, cpi, ppi, nfp = list(FOMC_DATES_2026), list(CPI_DATES_2026), list(PPI_DATES_2026), list(NFP_DATES_2026)
+
+    try:
+        with open(cache_path) as f:
+            cached = json.load(f)
+        for year_str, series in cached.get("years", {}).items():
+            for key, target in (("fomc", fomc), ("cpi", cpi), ("ppi", ppi), ("nfp", nfp)):
+                for iso in series.get(key, []):
+                    d = date.fromisoformat(iso)
+                    if d not in target:
+                        target.append(d)
+    except FileNotFoundError:
+        pass  # no cache built yet -- 2026 hardcoded lists are still a valid fallback
+    except (json.JSONDecodeError, KeyError, ValueError) as e:
+        print(f"[warning] econ calendar cache at {cache_path} is corrupt/unreadable ({e}) -- "
+              f"falling back to hardcoded 2026 dates only.")
+
+    return {"fomc": sorted(set(fomc)), "cpi": sorted(set(cpi)),
+            "ppi": sorted(set(ppi)), "nfp": sorted(set(nfp))}
 
 
 @dataclass
