@@ -53,10 +53,33 @@ class TradierClient:
         return r.json()
 
     def get_history(self, symbol: str, interval: str, start: str, end: str) -> dict:
+        """Daily/weekly/monthly bars ONLY -- Tradier's /markets/history
+        endpoint rejects any other interval with a 400. For intraday bars
+        (1min/5min/15min) use get_timesales() instead, which is a
+        different endpoint with a different response shape."""
         if requests is None:
             raise RuntimeError("requests package not installed")
         r = requests.get(f"{self.base_url}/markets/history",
                           params={"symbol": symbol, "interval": interval, "start": start, "end": end},
+                          headers=self._headers(), timeout=10)
+        r.raise_for_status()
+        return r.json()
+
+    def get_timesales(self, symbol: str, interval: str, start: str, end: str) -> dict:
+        """Intraday bars (interval one of 1min/5min/15min). BUG HISTORY:
+        run_live.py originally called get_history(..., "1min", ...), which
+        hit /markets/history and got a 400 -- that endpoint only accepts
+        daily/weekly/monthly. Intraday bars live at a separate endpoint,
+        /markets/timesales, with a different response shape:
+        {"series": {"data": [{"time":..., "open":..., "high":..., "low":
+        ..., "close":..., "volume":..., "vwap":...}, ...]}} -- or
+        {"series": None} if there's no data in the requested window
+        (e.g. window hasn't happened yet, or market's closed)."""
+        if requests is None:
+            raise RuntimeError("requests package not installed")
+        r = requests.get(f"{self.base_url}/markets/timesales",
+                          params={"symbol": symbol, "interval": interval, "start": start, "end": end,
+                                  "session_filter": "open"},
                           headers=self._headers(), timeout=10)
         r.raise_for_status()
         return r.json()

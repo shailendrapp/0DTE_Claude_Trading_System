@@ -123,12 +123,15 @@ def main():
     h, m = (int(x) for x in window["range_start_et"].split(":"))
     range_start = now_et.replace(hour=h, minute=m, second=0, microsecond=0)
     range_end = range_start + dt.timedelta(minutes=window["range_minutes"])
-    bars = client.get_history("SPX", "1min", range_start.strftime("%Y-%m-%d %H:%M"),
-                              range_end.strftime("%Y-%m-%d %H:%M"))
-    day_bars = bars.get("history", {}).get("day", [])
+    bars = client.get_timesales("SPX", "1min", range_start.strftime("%Y-%m-%d %H:%M"),
+                                 range_end.strftime("%Y-%m-%d %H:%M"))
+    day_bars = (bars.get("series") or {}).get("data", [])
+    if isinstance(day_bars, dict):  # Tradier returns a bare dict, not a list, for a single bar
+        day_bars = [day_bars]
     if not day_bars:
         raise SystemExit(f"No bars returned for window '{window['name']}' "
-                          f"({range_start}-{range_end}) -- check market is open.")
+                          f"({range_start}-{range_end}) -- check market is open and this "
+                          f"isn't being run before the window's range has actually elapsed.")
     highs = [float(b["high"]) for b in day_bars]
     lows = [float(b["low"]) for b in day_bars]
     em = expected_move(spot, vix, 1.0 / config.TRADING_DAYS_PER_YEAR)
