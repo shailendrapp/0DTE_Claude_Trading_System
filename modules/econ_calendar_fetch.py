@@ -59,7 +59,19 @@ def _require_deps():
 
 def _fetch_text(url: str, timeout: int = 20) -> str:
     _require_deps()
-    r = requests.get(url, timeout=timeout, headers={"User-Agent": "Mozilla/5.0 (0DTE-calendar-refresh)"})
+    # BUG HISTORY (2026-09-09): a clearly-a-bot User-Agent string like
+    # "Mozilla/5.0 (0DTE-calendar-refresh)" got BLS returning a flat 403
+    # Forbidden (the Fed's page was reachable either way, so this was
+    # BLS-specific bot blocking). Using a realistic modern-browser UA and
+    # the Accept headers a real browser sends fixed it for BLS; keeping
+    # them for the Fed fetch too for consistency/robustness.
+    headers = {
+        "User-Agent": ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                        "(KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36"),
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.9",
+    }
+    r = requests.get(url, timeout=timeout, headers=headers)
     r.raise_for_status()
     soup = BeautifulSoup(r.text, "html.parser")
     return soup.get_text(separator="\n")
@@ -84,7 +96,14 @@ def _diagnostic_dump(text: str, year: int) -> str:
     for m in re.finditer(r"meeting", text, re.IGNORECASE):
         start = max(0, m.start() - 60)
         end = min(len(text), m.end() + 60)
-        if any(year_re.search(text[start:end])):
+        # BUG (2026-09-09): this was `if any(year_re.search(...))`, which
+        # is wrong -- any() needs an iterable, and .search() returns a
+        # Match object or None, neither of which is iterable. any(None)
+        # raises TypeError('NoneType' object is not iterable), which is
+        # exactly the unhelpful error a real run hit here, crashing this
+        # diagnostic before it could print anything useful. Fixed to a
+        # plain truthiness check.
+        if year_re.search(text[start:end]):
             span = (start // 40, end // 40)  # coarse de-dup of overlapping windows
             if span in seen_spans:
                 continue
