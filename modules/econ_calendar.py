@@ -38,18 +38,32 @@ RELEASE_TIME_ET = {
     EventType.PPI: dt_time(8, 30),
 }
 
-# Confirmed 2026 dates via the Fed's and BLS's own published schedules
-# (checked 2026-09-08; covers Sep-Dec 2026 -- refresh/extend for the next
-# year rather than assume this stays current). FOMC decision date is the
-# second day of each 2-day meeting. NFP dates are also covered by the
-# is_first_friday() heuristic below in every case checked, but are listed
-# explicitly here since they were confirmed directly.
+# Full-year 2026 dates. FOMC confirmed directly from the Fed's own
+# calendar page (via econ_calendar_fetch.py's live scraper -- see that
+# module's fetch_fomc_dates for the ground-truth page structure this was
+# checked against, 2026-09-09). CPI/PPI/NFP updated 2026-09-09 from
+# BLS's own published schedule pages (bls.gov/schedule/news_release/
+# cpi.htm, ppi.htm, empsit.htm) -- BLS's site currently 403s the live
+# scraper (bot-management, not a parsing bug; see fetch_bls_dates/
+# _fetch_text_bls), so THIS hardcoded list is the only source for
+# CPI/PPI/NFP until that's resolved. FOMC decision date is the second
+# day of each 2-day meeting. NFP dates are also covered by the
+# is_first_friday() heuristic below in every case checked, but are
+# listed explicitly since they were confirmed directly. Re-verify/
+# extend for next year rather than assume this stays current.
 FOMC_DATES_2026 = [date(2026, 1, 28), date(2026, 3, 18), date(2026, 4, 29),
                    date(2026, 6, 17), date(2026, 7, 29), date(2026, 9, 16),
                    date(2026, 10, 28), date(2026, 12, 9)]
-CPI_DATES_2026 = [date(2026, 9, 11), date(2026, 10, 14), date(2026, 11, 10), date(2026, 12, 10)]
-PPI_DATES_2026 = [date(2026, 9, 10), date(2026, 10, 15), date(2026, 11, 13)]
-NFP_DATES_2026 = [date(2026, 10, 2), date(2026, 11, 6), date(2026, 12, 4)]
+CPI_DATES_2026 = [date(2026, 1, 13), date(2026, 2, 13), date(2026, 3, 11), date(2026, 4, 10),
+                   date(2026, 5, 12), date(2026, 6, 10), date(2026, 7, 14), date(2026, 8, 12),
+                   date(2026, 9, 11), date(2026, 10, 14), date(2026, 11, 10), date(2026, 12, 10)]
+PPI_DATES_2026 = [date(2026, 1, 14), date(2026, 1, 30), date(2026, 2, 27), date(2026, 3, 18),
+                   date(2026, 4, 14), date(2026, 5, 13), date(2026, 6, 11), date(2026, 7, 15),
+                   date(2026, 8, 13), date(2026, 9, 10), date(2026, 10, 15), date(2026, 11, 13),
+                   date(2026, 12, 15)]
+NFP_DATES_2026 = [date(2026, 1, 9), date(2026, 2, 11), date(2026, 3, 6), date(2026, 4, 3),
+                   date(2026, 5, 8), date(2026, 6, 5), date(2026, 7, 2), date(2026, 8, 7),
+                   date(2026, 9, 4), date(2026, 10, 2), date(2026, 11, 6), date(2026, 12, 4)]
 
 CALENDAR_CACHE_PATH = os.path.join("data", "econ_calendar_cache.json")
 

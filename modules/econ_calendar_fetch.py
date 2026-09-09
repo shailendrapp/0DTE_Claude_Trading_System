@@ -47,7 +47,14 @@ MONTHS = {
 MONTH_RE = "|".join(MONTHS.keys())
 
 FULL_DATE_RE = re.compile(rf"({MONTH_RE})\s+(\d{{1,2}}),?\s+(\d{{4}})")
-FOMC_RANGE_RE = re.compile(rf"({MONTH_RE})\s+(\d{{1,2}})(?:[-–](\d{{1,2}}))?\*?")
+# BUG HISTORY (2026-09-09): day2 used to be optional ((?:[-–](\d{1,2}))?),
+# so this also matched plain "Month D" mentions with no range at all --
+# e.g. "(Released February 18, 2026)" minutes-release footnotes inside
+# each meeting's own block. That inflated 2026's real 8 meetings to 13
+# parsed "dates". Every real FOMC meeting entry on the page is shown as
+# a day RANGE ("27-28", "17-18*"), so day2 is now mandatory -- this
+# regex only matches actual meeting entries, never single-day mentions.
+FOMC_RANGE_RE = re.compile(rf"({MONTH_RE})\s+(\d{{1,2}})[-–](\d{{1,2}})\*?")
 
 
 def _require_deps():
@@ -106,7 +113,15 @@ def _fetch_text_bls(url: str, timeout: int = 20) -> str:
     except requests.RequestException:
         pass  # warmup is best-effort; still try the real request either way
     r = session.get(url, timeout=timeout, headers={"Referer": "https://www.bls.gov/"})
-    r.raise_for_status()
+    if not r.ok:
+        # Surface the actual block-page body (first 500 chars) rather
+        # than just "403 Client Error" -- a real bot-management block
+        # page usually names itself (Akamai/PerimeterX/Cloudflare all
+        # have distinctive block-page text), which tells us definitively
+        # whether this is something header/cookie tricks could ever get
+        # past, instead of guessing.
+        raise ValueError(f"BLS returned HTTP {r.status_code} for {url} -- session/cookie warmup did not "
+                          f"help. First 500 chars of the response body:\n{r.text[:500]}")
     soup = BeautifulSoup(r.text, "html.parser")
     return soup.get_text(separator="\n")
 
@@ -249,31 +264,29 @@ def fetch_bls_dates(year: int, label: str, expected_count_range: tuple[int, int]
 
 
 def fetch_all(year: int) -> dict:
-    """Fetches all four series for `year`. Raises on ANY failure -- see
-    refresh_econ_calendar.py for how a partial/failed fetch is handled
-    (never write a partial cache).
+    """Fetches all four series for `year`. NEVER raises -- returns
+    {"series": {name: [date,...]}, "errors": {name: "message"}}, one
+    entry per series that succeeded/failed respectively.
 
-    BUG HISTORY (2026-09-09): this used to be a plain dict comprehension,
-    so a FOMC failure raised immediately and CPI/PPI/NFP were never even
-    attempted -- meaning two straight debugging rounds only ever showed
-    us the FOMC error, with zero information about whether the BLS-side
-    scraper works at all. Now runs all four independently and combines
-    every failure into one error message, so a single run's log shows
-    the full picture instead of just whichever series happens to be
-    fetched first."""
+    BUG HISTORY (2026-09-09): v1 was a plain dict comprehension, so a
+    FOMC failure raised immediately and CPI/PPI/NFP were never even
+    attempted, hiding whether BLS worked at all. v2 ran all four but
+    still raised if ANY failed -- which meant that once FOMC's own
+    parser got fixed and started working, its good data STILL never
+    got written, because BLS's persistent 403s made the whole year
+    "fail" as a unit. Fixed for real this time: each series' success/
+    failure is independent all the way out to refresh_econ_calendar.py,
+    so a working FOMC scrape is cached even while BLS stays blocked."""
     series = {
         "fomc": lambda: fetch_fomc_dates(year),
         "cpi": lambda: fetch_bls_dates(year, "Consumer Price Index", (10, 13)),
         "ppi": lambda: fetch_bls_dates(year, "Producer Price Index", (10, 14)),
         "nfp": lambda: fetch_bls_dates(year, "Employment Situation", (10, 13)),
     }
-    result = {}
-    errors = []
+    result, errors = {}, {}
     for name, fn in series.items():
         try:
             result[name] = fn()
         except Exception as e:  # noqa: BLE001
-            errors.append(f"[{name}] {e}")
-    if errors:
-        raise ValueError(f"{len(errors)}/4 series failed for {year}:\n" + "\n\n".join(errors))
-    return result
+            errors[name] = str(e)
+    return {"series": result, "errors": errors}

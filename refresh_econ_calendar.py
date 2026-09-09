@@ -14,15 +14,21 @@ Usage:
     python refresh_econ_calendar.py                  # this year + next year
     python refresh_econ_calendar.py --years 2026 2027
 
-FAIL-SAFE: if fetching/parsing fails for a year, this prints a clear
-error and leaves that year OUT of the written cache rather than writing
-partial/wrong data -- any year missing from the cache falls back to
-econ_calendar.py's hardcoded lists (if that year is 2026) or to an empty
-list (any other year), which only means event-risk gating is unavailable
-for that year, not wrong. Exits non-zero if EVERY year failed, so the
-scheduled workflow shows red and someone notices -- a single year's
-failure (e.g. next year's BLS schedule not published yet) exits 0 since
-that's an expected, not exceptional, state.
+FAIL-SAFE, per SERIES not per year: fetch_all() now returns whichever of
+FOMC/CPI/PPI/NFP succeeded for a year even if others failed (e.g. FOMC
+scraping works while BLS blocks CPI/PPI/NFP with a 403) -- a failed
+series for a year keeps whatever was already cached for it (or falls
+back to econ_calendar.py's hardcoded 2026 lists / an empty list if
+nothing was ever cached), never gets overwritten with nothing. Exits
+non-zero only if EVERY series for EVERY requested year failed, so the
+scheduled workflow shows red and someone notices -- a single series/
+year failure (e.g. BLS still blocked, or next year's schedule not
+published yet) exits 0 since that's an expected, not exceptional, state.
+
+BUG HISTORY (2026-09-09): earlier versions treated a year as all-or-
+nothing -- one failing series (BLS) meant a working series (FOMC, once
+its parser got fixed) never got written either. Fixed by merging at
+the series level.
 """
 import argparse
 import datetime as dt
@@ -49,14 +55,17 @@ def main():
     cache = existing.get("years", {})
     any_success = False
     for year in args.years:
-        try:
-            result = fetch_all(year)
-            cache[str(year)] = {k: [d.isoformat() for d in v] for k, v in result.items()}
-            print(f"[ok] {year}: FOMC={len(result['fomc'])} CPI={len(result['cpi'])} "
-                  f"PPI={len(result['ppi'])} NFP={len(result['nfp'])}")
+        out = fetch_all(year)
+        succeeded, failed = out["series"], out["errors"]
+        if succeeded:
+            year_cache = dict(cache.get(str(year), {}))  # keep any series already cached for this year
+            for name, dates in succeeded.items():
+                year_cache[name] = [d.isoformat() for d in dates]
+            cache[str(year)] = year_cache
             any_success = True
-        except Exception as e:  # noqa: BLE001
-            print(f"[skip] {year}: {e}")
+            print(f"[ok] {year}: " + ", ".join(f"{name}={len(dates)}" for name, dates in succeeded.items()))
+        for name, err in failed.items():
+            print(f"[skip] {year}.{name}: {err}")
 
     if not any_success and not existing:
         raise SystemExit("Every requested year failed to fetch and there's no existing cache -- "
