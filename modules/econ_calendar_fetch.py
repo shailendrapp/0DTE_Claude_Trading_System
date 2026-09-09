@@ -76,14 +76,24 @@ def fetch_fomc_dates(year: int) -> list[date]:
     repeating the year on every line)."""
     text = _fetch_text("https://www.federalreserve.gov/monetarypolicy/fomccalendars.htm")
 
-    # Find the block of text between "<year> Meetings" and the next
-    # "<year+1> Meetings" (or end of the meetings section).
-    start_marker = f"{year}"
+    # BUG HISTORY (2026-09-09): originally searched for the bare year
+    # number ("2027") as the section start, and read everything up to the
+    # NEXT bare occurrence of "2028" as the section end. That's wrong --
+    # the page mentions a given year in plenty of places besides the
+    # actual meeting-dates heading (year-browse links, footers, archived
+    # statements), so this grabbed a huge, wrong slice of the page and
+    # parsed 96 "dates" out of it instead of ~8. Fixed by matching the
+    # much more specific heading text "<year> Meetings" (as in "2027
+    # Meetings"), which should only appear once, right where the actual
+    # meeting list starts.
+    start_marker = f"{year} Meetings"
     idx = text.find(start_marker)
     if idx == -1:
-        raise ValueError(f"Could not find a '{year}' section on the Fed's FOMC calendar page")
-    next_idx = text.find(str(year + 1), idx + len(start_marker))
-    block = text[idx: next_idx if next_idx != -1 else idx + 4000]
+        raise ValueError(f"Could not find a '{start_marker}' heading on the Fed's FOMC calendar page "
+                          f"-- the page's heading text may not match this exactly.")
+    next_marker = f"{year + 1} Meetings"
+    next_idx = text.find(next_marker, idx + len(start_marker))
+    block = text[idx: next_idx if next_idx != -1 else idx + 2000]
 
     dates = []
     for m in FOMC_RANGE_RE.finditer(block):
