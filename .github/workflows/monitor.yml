@@ -1,0 +1,65 @@
+name: 0DTE Monitor
+
+# Polls all of today's open signals (run_monitor.py) roughly every 5
+# minutes across the regular session, 09:30-16:00 ET. Same DST caveat as
+# entry.yml: cron times below are UTC assuming EDT (UTC-4, correct through
+# ~early Nov 2026) -- shift by 1 hour at each US DST transition.
+#
+#   09:30-09:55 ET (13:30-13:55 UTC): '30-55/5 13 * * 1-5'
+#   10:00-19:55 UTC = 06:00-15:55 ET... see note below, this line covers
+#     10:00 ET through 15:55 ET as 14:00-19:55 UTC: '*/5 14-19 * * 1-5'
+#   16:00 ET catch-all (20:00 UTC), covers the 15:45 ET hard EOD close
+#     plus a buffer: '0 20 * * 1-5'
+#
+# Also runs on workflow_dispatch for manual testing.
+#
+# HONEST LIMITATION (same one already discussed for the monitoring
+# design): GitHub's scheduled triggers are best-effort and can slip by a
+# few minutes, more under platform load -- a fast intraday move can go
+# against an open lot for longer than 5 minutes before this next fires
+# and closes it. If that gap ever looks too wide once you're watching it
+# live, the fix is a persistent worker polling config.MONITOR_POLL_SECONDS
+# instead of Actions cron -- not a change to run_monitor.py's decision
+# logic itself.
+
+on:
+  schedule:
+    - cron: '30-55/5 13 * * 1-5'
+    - cron: '*/5 14-19 * * 1-5'
+    - cron: '0 20 * * 1-5'
+  workflow_dispatch: {}
+
+permissions:
+  contents: write
+
+concurrency:
+  group: 0dte-state-writer   # shared with entry.yml so state/ writes never race
+  cancel-in-progress: false
+
+jobs:
+  monitor:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run monitor
+        env:
+          TRADIER_TOKEN: ${{ secrets.TRADIER_TOKEN }}
+          TRADIER_SANDBOX_ACCOUNT_ID: ${{ secrets.TRADIER_SANDBOX_ACCOUNT_ID }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: python run_monitor.py
+
+      - name: Commit any state changes (exits, .done renames, pnl_log.csv)
+        run: |
+          git config user.name "0dte-bot"
+          git config user.email "0dte-bot@users.noreply.github.com"
+          git add state/
+          git diff --cached --quiet || (git commit -m "monitor state: $(date -u +%FT%TZ)" && git push)

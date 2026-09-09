@@ -1,0 +1,81 @@
+name: 0DTE Entry
+
+# Fires the entry decision (run_live.py) for one window per scheduled cron.
+# Cron times below are UTC and assume US Eastern is on DAYLIGHT time
+# (EDT, UTC-4) -- correct now (Sept 2026). They must be shifted by 1 hour
+# around the US DST transitions (~first Sun of Nov -> standard time
+# UTC-5; ~second Sun of March -> daylight time UTC-4 again), or entries
+# will fire ~1 hour off true ET clock time until you update them.
+#
+# window -> ET decision time -> UTC cron (current, EDT):
+#   morning   09:30 + 30min range = 10:00 ET -> 14:00 UTC -> '0 14 * * 1-5'
+#   midday    11:30 + 15min range = 11:45 ET -> 15:45 UTC -> '45 15 * * 1-5'
+#   afternoon 13:30 + 15min range = 13:45 ET -> 17:45 UTC -> '45 17 * * 1-5'
+#
+# GitHub's scheduled triggers are best-effort, not guaranteed-to-the-minute
+# -- expect occasional delays of a few minutes, more during platform load.
+# That's consistent with the ~5min monitoring cadence already accepted
+# elsewhere in this design; it is NOT millisecond-precise execution.
+
+on:
+  schedule:
+    - cron: '0 14 * * 1-5'
+    - cron: '45 15 * * 1-5'
+    - cron: '45 17 * * 1-5'
+  workflow_dispatch:
+    inputs:
+      window:
+        description: 'Window to run manually (for testing before relying on the schedule)'
+        required: true
+        default: 'morning'
+        type: choice
+        options: [morning, midday, afternoon]
+
+permissions:
+  contents: write
+
+concurrency:
+  group: 0dte-state-writer   # shared with monitor.yml so state/ writes never race
+  cancel-in-progress: false
+
+jobs:
+  entry:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Determine window
+        id: window
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "name=${{ github.event.inputs.window }}" >> "$GITHUB_OUTPUT"
+          else
+            case "${{ github.event.schedule }}" in
+              '0 14 * * 1-5')  echo "name=morning"   >> "$GITHUB_OUTPUT" ;;
+              '45 15 * * 1-5') echo "name=midday"    >> "$GITHUB_OUTPUT" ;;
+              '45 17 * * 1-5') echo "name=afternoon" >> "$GITHUB_OUTPUT" ;;
+              *) echo "Unrecognized schedule '${{ github.event.schedule }}'" >&2; exit 1 ;;
+            esac
+          fi
+
+      - name: Run entry decision
+        env:
+          TRADIER_TOKEN: ${{ secrets.TRADIER_TOKEN }}
+          TRADIER_SANDBOX_ACCOUNT_ID: ${{ secrets.TRADIER_SANDBOX_ACCOUNT_ID }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: python run_live.py --window ${{ steps.window.outputs.name }}
+
+      - name: Commit any new/updated state files
+        run: |
+          git config user.name "0dte-bot"
+          git config user.email "0dte-bot@users.noreply.github.com"
+          git add state/
+          git diff --cached --quiet || (git commit -m "entry state: ${{ steps.window.outputs.name }} $(date -u +%FT%TZ)" && git push)
