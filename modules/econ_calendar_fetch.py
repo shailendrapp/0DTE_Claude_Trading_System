@@ -65,6 +65,38 @@ def _fetch_text(url: str, timeout: int = 20) -> str:
     return soup.get_text(separator="\n")
 
 
+def _diagnostic_dump(text: str, year: int) -> str:
+    """Builds a diagnostic excerpt of the real fetched page text, for
+    inclusion in a raised error's message so it lands in the Action log.
+    We've now guessed wrong twice about this page's exact heading text
+    (bare year -> way too broad; "<year> Meetings" -> not found at all)
+    from this environment, which cannot fetch the raw page itself to
+    check. Rather than guess a third time, dump enough real ground truth
+    -- the first chunk of the page text, plus a context window around
+    every case-insensitive occurrence of "meeting" that's near a 4-digit
+    year -- that the actual heading structure can be read directly out
+    of the next failed run's log and fixed with certainty."""
+    lines = ["----- DIAGNOSTIC: first 2000 chars of fetched page text -----",
+             text[:2000],
+             "----- DIAGNOSTIC: context around occurrences of 'meeting' -----"]
+    year_re = re.compile(r"\b20\d{2}\b")
+    seen_spans = set()
+    for m in re.finditer(r"meeting", text, re.IGNORECASE):
+        start = max(0, m.start() - 60)
+        end = min(len(text), m.end() + 60)
+        if any(year_re.search(text[start:end])):
+            span = (start // 40, end // 40)  # coarse de-dup of overlapping windows
+            if span in seen_spans:
+                continue
+            seen_spans.add(span)
+            snippet = text[start:end].replace("\n", " \\n ")
+            lines.append(f"  ...{snippet}...")
+        if len(lines) > 60:  # don't blow up the log
+            lines.append("  (truncated -- too many matches)")
+            break
+    return "\n".join(lines)
+
+
 def fetch_fomc_dates(year: int) -> list[date]:
     """Decision-day (second/last day of each 2-day meeting) FOMC dates for
     `year`, scraped from the Fed's own calendar page. That page lists
@@ -82,15 +114,20 @@ def fetch_fomc_dates(year: int) -> list[date]:
     # the page mentions a given year in plenty of places besides the
     # actual meeting-dates heading (year-browse links, footers, archived
     # statements), so this grabbed a huge, wrong slice of the page and
-    # parsed 96 "dates" out of it instead of ~8. Fixed by matching the
-    # much more specific heading text "<year> Meetings" (as in "2027
-    # Meetings"), which should only appear once, right where the actual
-    # meeting list starts.
+    # parsed 96 "dates" out of it instead of ~8. Attempted fix #2: matched
+    # the more specific heading text "<year> Meetings" -- but that ALSO
+    # failed (not found at all, for both 2026 and 2027), proving the
+    # assumed heading text doesn't literally exist in the real page. This
+    # environment cannot fetch the raw page itself to verify, so rather
+    # than guess a third time, a failed lookup now dumps real page text
+    # into the raised error (see _diagnostic_dump) so the next run's
+    # Action log shows real ground truth instead of another blind guess.
     start_marker = f"{year} Meetings"
     idx = text.find(start_marker)
     if idx == -1:
         raise ValueError(f"Could not find a '{start_marker}' heading on the Fed's FOMC calendar page "
-                          f"-- the page's heading text may not match this exactly.")
+                          f"-- the page's heading text may not match this exactly.\n"
+                          f"{_diagnostic_dump(text, year)}")
     next_marker = f"{year + 1} Meetings"
     next_idx = text.find(next_marker, idx + len(start_marker))
     block = text[idx: next_idx if next_idx != -1 else idx + 2000]
@@ -107,7 +144,8 @@ def fetch_fomc_dates(year: int) -> list[date]:
     dates = sorted(set(dates))
     if not (6 <= len(dates) <= 10):  # the FOMC holds 8 meetings/year; allow slack for parse noise
         raise ValueError(f"Parsed an implausible number of FOMC dates for {year}: {len(dates)} -- "
-                          f"page structure likely changed, not trusting this result: {dates}")
+                          f"page structure likely changed, not trusting this result: {dates}\n"
+                          f"----- DIAGNOSTIC: matched block (first 2000 chars) -----\n{block[:2000]}")
     return dates
 
 
@@ -134,19 +172,45 @@ def fetch_bls_dates(year: int, label: str, expected_count_range: tuple[int, int]
     dates = sorted(set(dates))
     lo, hi = expected_count_range
     if not (lo <= len(dates) <= hi):
+        # We have not yet confirmed the BLS side works at all (both real
+        # runs so far only got far enough to show FOMC failures) -- same
+        # diagnostic-dump treatment as fetch_fomc_dates rather than
+        # guessing blind if/when this trips.
+        occ_count = len(re.findall(re.escape(label), text))
         raise ValueError(f"Parsed an implausible number of '{label}' dates for {year}: "
                           f"{len(dates)} (expected {lo}-{hi}) -- page structure likely changed, "
-                          f"not trusting this result: {dates}")
+                          f"not trusting this result: {dates}\n"
+                          f"----- DIAGNOSTIC: '{label}' occurs {occ_count} times in fetched text -----\n"
+                          f"----- DIAGNOSTIC: first 2000 chars of fetched page text -----\n{text[:2000]}")
     return dates
 
 
 def fetch_all(year: int) -> dict:
     """Fetches all four series for `year`. Raises on ANY failure -- see
     refresh_econ_calendar.py for how a partial/failed fetch is handled
-    (never write a partial cache)."""
-    return {
-        "fomc": fetch_fomc_dates(year),
-        "cpi": fetch_bls_dates(year, "Consumer Price Index", (10, 13)),
-        "ppi": fetch_bls_dates(year, "Producer Price Index", (10, 14)),
-        "nfp": fetch_bls_dates(year, "Employment Situation", (10, 13)),
+    (never write a partial cache).
+
+    BUG HISTORY (2026-09-09): this used to be a plain dict comprehension,
+    so a FOMC failure raised immediately and CPI/PPI/NFP were never even
+    attempted -- meaning two straight debugging rounds only ever showed
+    us the FOMC error, with zero information about whether the BLS-side
+    scraper works at all. Now runs all four independently and combines
+    every failure into one error message, so a single run's log shows
+    the full picture instead of just whichever series happens to be
+    fetched first."""
+    series = {
+        "fomc": lambda: fetch_fomc_dates(year),
+        "cpi": lambda: fetch_bls_dates(year, "Consumer Price Index", (10, 13)),
+        "ppi": lambda: fetch_bls_dates(year, "Producer Price Index", (10, 14)),
+        "nfp": lambda: fetch_bls_dates(year, "Employment Situation", (10, 13)),
     }
+    result = {}
+    errors = []
+    for name, fn in series.items():
+        try:
+            result[name] = fn()
+        except Exception as e:  # noqa: BLE001
+            errors.append(f"[{name}] {e}")
+    if errors:
+        raise ValueError(f"{len(errors)}/4 series failed for {year}:\n" + "\n\n".join(errors))
+    return result
