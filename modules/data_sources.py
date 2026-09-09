@@ -35,35 +35,35 @@ class TradierClient:
     def _headers(self):
         return {"Authorization": f"Bearer {self.token}", "Accept": "application/json"}
 
-    def get_quote(self, symbol: str) -> dict:
+    def _get(self, path: str, params: dict) -> dict:
+        """Shared GET + error handling. Tradier returns a JSON body
+        describing WHY a 4xx happened (invalid symbol, missing
+        entitlement, bad param, etc.) -- requests' raise_for_status()
+        alone discards that body, which is why earlier errors here only
+        ever showed a bare '400 Client Error' with no explanation. This
+        prints the response body before raising so the real reason shows
+        up in the Action log instead of forcing another guess-and-check
+        round trip."""
         if requests is None:
             raise RuntimeError("requests package not installed")
-        r = requests.get(f"{self.base_url}/markets/quotes",
-                          params={"symbols": symbol}, headers=self._headers(), timeout=10)
-        r.raise_for_status()
+        r = requests.get(f"{self.base_url}{path}", params=params, headers=self._headers(), timeout=10)
+        if not r.ok:
+            print(f"[Tradier {r.status_code}] GET {path} params={params}\nResponse body: {r.text}")
+            r.raise_for_status()
         return r.json()
 
+    def get_quote(self, symbol: str) -> dict:
+        return self._get("/markets/quotes", {"symbols": symbol})
+
     def get_option_chain(self, symbol: str, expiration: str) -> dict:
-        if requests is None:
-            raise RuntimeError("requests package not installed")
-        r = requests.get(f"{self.base_url}/markets/options/chains",
-                          params={"symbol": symbol, "expiration": expiration, "greeks": "true"},
-                          headers=self._headers(), timeout=10)
-        r.raise_for_status()
-        return r.json()
+        return self._get("/markets/options/chains", {"symbol": symbol, "expiration": expiration, "greeks": "true"})
 
     def get_history(self, symbol: str, interval: str, start: str, end: str) -> dict:
         """Daily/weekly/monthly bars ONLY -- Tradier's /markets/history
         endpoint rejects any other interval with a 400. For intraday bars
         (1min/5min/15min) use get_timesales() instead, which is a
         different endpoint with a different response shape."""
-        if requests is None:
-            raise RuntimeError("requests package not installed")
-        r = requests.get(f"{self.base_url}/markets/history",
-                          params={"symbol": symbol, "interval": interval, "start": start, "end": end},
-                          headers=self._headers(), timeout=10)
-        r.raise_for_status()
-        return r.json()
+        return self._get("/markets/history", {"symbol": symbol, "interval": interval, "start": start, "end": end})
 
     def get_timesales(self, symbol: str, interval: str, start: str, end: str) -> dict:
         """Intraday bars (interval one of 1min/5min/15min). BUG HISTORY:
@@ -74,15 +74,16 @@ class TradierClient:
         {"series": {"data": [{"time":..., "open":..., "high":..., "low":
         ..., "close":..., "volume":..., "vwap":...}, ...]}} -- or
         {"series": None} if there's no data in the requested window
-        (e.g. window hasn't happened yet, or market's closed)."""
-        if requests is None:
-            raise RuntimeError("requests package not installed")
-        r = requests.get(f"{self.base_url}/markets/timesales",
-                          params={"symbol": symbol, "interval": interval, "start": start, "end": end,
-                                  "session_filter": "open"},
-                          headers=self._headers(), timeout=10)
-        r.raise_for_status()
-        return r.json()
+        (e.g. window hasn't happened yet, or market's closed). If THIS
+        still 400s after that fix, the likely remaining cause is that
+        Tradier's sandbox/your account plan doesn't carry intraday index
+        (SPX) market data entitlement at all (equities/ETFs and options
+        are broadly available; raw index history/timesales sometimes
+        needs a separate data subscription) -- the printed response body
+        from _get() will say so explicitly if that's it."""
+        return self._get("/markets/timesales",
+                          {"symbol": symbol, "interval": interval, "start": start, "end": end,
+                           "session_filter": "open"})
 
 
 def parse_tradier_chain(raw_chain_json: dict) -> list[dict]:
