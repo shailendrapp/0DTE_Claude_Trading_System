@@ -57,21 +57,55 @@ def _require_deps():
         raise RuntimeError("beautifulsoup4 package not installed")
 
 
+_BROWSER_HEADERS = {
+    "User-Agent": ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                    "(KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36"),
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    "Accept-Language": "en-US,en;q=0.9",
+}
+
+
 def _fetch_text(url: str, timeout: int = 20) -> str:
     _require_deps()
     # BUG HISTORY (2026-09-09): a clearly-a-bot User-Agent string like
     # "Mozilla/5.0 (0DTE-calendar-refresh)" got BLS returning a flat 403
-    # Forbidden (the Fed's page was reachable either way, so this was
-    # BLS-specific bot blocking). Using a realistic modern-browser UA and
-    # the Accept headers a real browser sends fixed it for BLS; keeping
-    # them for the Fed fetch too for consistency/robustness.
-    headers = {
-        "User-Agent": ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-                        "(KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36"),
-        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-        "Accept-Language": "en-US,en;q=0.9",
-    }
-    r = requests.get(url, timeout=timeout, headers=headers)
+    # Forbidden (the Fed's page was reachable either way -- BLS-specific
+    # bot blocking). A realistic browser UA + Accept headers alone was
+    # NOT enough to fix BLS (still 403'd on a real run) -- see
+    # _fetch_text_bls below for the session/cookie-warmup attempt used
+    # for BLS specifically. Kept here (headers only, no warmup) for the
+    # Fed fetch, which has never 403'd.
+    r = requests.get(url, timeout=timeout, headers=_BROWSER_HEADERS)
+    r.raise_for_status()
+    soup = BeautifulSoup(r.text, "html.parser")
+    return soup.get_text(separator="\n")
+
+
+def _fetch_text_bls(url: str, timeout: int = 20) -> str:
+    """Like _fetch_text, but for bls.gov specifically: browser headers
+    alone still got a flat 403 on a real run (2026-09-09), which looks
+    like bot-management that gates on more than just User-Agent/Accept
+    (a cookie/session check, or an IP-reputation block on cloud-hosted
+    runner IPs -- we can't tell which from a 403 alone). This attempts
+    one plausible, low-cost next step: warm up a session by visiting the
+    BLS homepage first (picking up any cookies a real browser would get
+    on first visit) before requesting the actual schedule page, with a
+    Referer set to make the second request look like in-site navigation
+    rather than a cold direct hit. If this STILL 403s, that's reasonably
+    strong evidence it's an IP-level or JS-challenge block that no amount
+    of header/cookie tweaking from plain `requests` can get past -- at
+    that point the pragmatic fix is switching CPI/PPI/NFP to a hardcoded
+    annual list (like econ_calendar.py's FOMC fallback) updated once a
+    year when BLS publishes its schedule, rather than continuing to
+    iterate against bot-management infrastructure."""
+    _require_deps()
+    session = requests.Session()
+    session.headers.update(_BROWSER_HEADERS)
+    try:
+        session.get("https://www.bls.gov/", timeout=timeout)
+    except requests.RequestException:
+        pass  # warmup is best-effort; still try the real request either way
+    r = session.get(url, timeout=timeout, headers={"Referer": "https://www.bls.gov/"})
     r.raise_for_status()
     soup = BeautifulSoup(r.text, "html.parser")
     return soup.get_text(separator="\n")
@@ -116,40 +150,47 @@ def _diagnostic_dump(text: str, year: int) -> str:
     return "\n".join(lines)
 
 
+FOMC_HEADING_RE = re.compile(r"(\d{4})\s+FOMC\s+Meetings")
+
+
 def fetch_fomc_dates(year: int) -> list[date]:
     """Decision-day (second/last day of each 2-day meeting) FOMC dates for
-    `year`, scraped from the Fed's own calendar page. That page lists
-    BOTH the current and next year, so this asks for a specific year and
-    only keeps dates whose month/day combination is plausible within a
-    section attributable to that year (see the year-boundary handling
-    below -- the page has no unambiguous per-line year marker for FOMC,
-    since it groups meetings under a "20XX Meetings" heading instead of
-    repeating the year on every line)."""
+    `year`, scraped from the Fed's own calendar page. That page covers
+    2021-2027 all on one page, with a heading like "2026 FOMC Meetings"
+    before each year's list -- and confirmed (2026-09-09, via a real
+    diagnostic dump) NOT in chronological order: the actual document
+    order is 2026, 2025, 2024, 2023, 2022, 2021, 2027, followed by a
+    trailing "Note:" footnote that mentions a 2028 date. So a year's
+    section is bounded by the NEXT heading THAT ACTUALLY APPEARS AFTER
+    IT IN THE DOCUMENT (whatever year that heading names -- year+1 is
+    not a safe assumption here), and additionally capped at that
+    trailing "Note:" so the last heading's section doesn't swallow the
+    next year's footnote date."""
     text = _fetch_text("https://www.federalreserve.gov/monetarypolicy/fomccalendars.htm")
 
-    # BUG HISTORY (2026-09-09): originally searched for the bare year
-    # number ("2027") as the section start, and read everything up to the
-    # NEXT bare occurrence of "2028" as the section end. That's wrong --
-    # the page mentions a given year in plenty of places besides the
-    # actual meeting-dates heading (year-browse links, footers, archived
-    # statements), so this grabbed a huge, wrong slice of the page and
-    # parsed 96 "dates" out of it instead of ~8. Attempted fix #2: matched
-    # the more specific heading text "<year> Meetings" -- but that ALSO
-    # failed (not found at all, for both 2026 and 2027), proving the
-    # assumed heading text doesn't literally exist in the real page. This
-    # environment cannot fetch the raw page itself to verify, so rather
-    # than guess a third time, a failed lookup now dumps real page text
-    # into the raised error (see _diagnostic_dump) so the next run's
-    # Action log shows real ground truth instead of another blind guess.
-    start_marker = f"{year} Meetings"
-    idx = text.find(start_marker)
-    if idx == -1:
-        raise ValueError(f"Could not find a '{start_marker}' heading on the Fed's FOMC calendar page "
+    # BUG HISTORY (2026-09-09): v1 searched for the bare year number
+    # ("2027") as the section start, up to the next bare "2028" -- way
+    # too broad (matched year-browse links, footers, archived
+    # statements), parsing 96 "dates" instead of ~8. v2 matched "<year>
+    # Meetings" -- not found at all (real heading has "FOMC" in it too).
+    # v3 (this version) matches "<year> FOMC Meetings" via regex across
+    # the WHOLE page up front, keeping every heading's document position
+    # -- confirmed present for both 2026 and 2027 via a real diagnostic
+    # dump -- and bounds each year's block by document adjacency, not by
+    # a year+1 guess, since the page's year order is not chronological.
+    headings = [(m.start(), int(m.group(1)), m.end()) for m in FOMC_HEADING_RE.finditer(text)]
+    target = next((h for h in headings if h[1] == year), None)
+    if target is None:
+        raise ValueError(f"Could not find a '{year} FOMC Meetings' heading on the Fed's FOMC calendar page "
                           f"-- the page's heading text may not match this exactly.\n"
                           f"{_diagnostic_dump(text, year)}")
-    next_marker = f"{year + 1} Meetings"
-    next_idx = text.find(next_marker, idx + len(start_marker))
-    block = text[idx: next_idx if next_idx != -1 else idx + 2000]
+    idx, _, end_of_heading = target
+    pos_in_list = headings.index(target)
+    next_idx = headings[pos_in_list + 1][0] if pos_in_list + 1 < len(headings) else len(text)
+    note_idx = text.find("Note:", end_of_heading)
+    if note_idx != -1 and note_idx < next_idx:
+        next_idx = note_idx
+    block = text[idx:next_idx]
 
     dates = []
     for m in FOMC_RANGE_RE.finditer(block):
@@ -176,8 +217,11 @@ def fetch_bls_dates(year: int, label: str, expected_count_range: tuple[int, int]
     the next 80 characters -- markup-agnostic (works regardless of table/
     list structure) but assumes the date appears reasonably close to the
     label in the page's linear text, which held true as observed
-    2026-09-09."""
-    text = _fetch_text(f"https://www.bls.gov/schedule/{year}/home.htm")
+    2026-09-09. Uses _fetch_text_bls (session/cookie warmup), not plain
+    _fetch_text -- BLS 403'd on browser headers alone; see that
+    function's docstring for what this does and does not defend
+    against."""
+    text = _fetch_text_bls(f"https://www.bls.gov/schedule/{year}/home.htm")
 
     dates = []
     for m in re.finditer(re.escape(label), text):
