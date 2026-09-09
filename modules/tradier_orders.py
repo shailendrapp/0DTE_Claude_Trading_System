@@ -105,7 +105,18 @@ def submit_multileg_order(client: TradierClient, account_id: str, underlying: st
 
     r = requests.post(f"{client.base_url}/accounts/{account_id}/orders",
                        data=payload, headers=client._headers(), timeout=15)
-    r.raise_for_status()
+    if not r.ok:
+        # Same fix as modules/data_sources.py's _get(): print the response
+        # body before raising, since raise_for_status() alone discards it.
+        # A live run's first 500 here (2026-09-09) gave zero information
+        # beyond "500 Server Error" -- root-caused separately to un-rounded
+        # strikes producing an OCC symbol for a nonexistent contract (see
+        # strategy_selector.build_strikes' SPX_STRIKE_INCREMENT fix), but
+        # this print is what would have shown that directly instead of
+        # requiring a guess.
+        print(f"[Tradier {r.status_code}] POST /accounts/{account_id}/orders payload={payload}\n"
+              f"Response body: {r.text}")
+        r.raise_for_status()
     return r.json()
 
 

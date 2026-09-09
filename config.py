@@ -70,6 +70,20 @@ USE_IRON_FLY_IN_LOW_IV_RANGE_BOUND = False
 WING_WIDTH_EM_FRACTION = 1.0   # wing width = this fraction of the expected move
 MIN_WING_WIDTH = 5.0           # floor so ultra-low-vol days don't get a ~0 wing
 
+# ---- Strike rounding ----
+# BUG HISTORY: strategy_selector.build_strikes() originally returned raw
+# floats (spot +/- fraction-of-expected-move), e.g. 7749.508330104655.
+# Real SPX/SPXW options only list at this increment -- an OCC symbol built
+# from an un-rounded strike names a contract that doesn't exist, and a
+# live Tradier sandbox order using one got a bare 500 with no other
+# explanation. All strikes are now rounded to the nearest multiple of this
+# before being used anywhere (backtest and live both, for consistency).
+# 5.0 is standard for SPX/SPXW; some near-the-money weekly strikes list at
+# 1-point increments too, but 5 is the safe default -- tighten only if you
+# confirm 1-point strikes are actually tradable for the specific
+# expirations/strikes this system selects.
+SPX_STRIKE_INCREMENT = 5.0
+
 # ---- Position sizing ----
 BASE_CONTRACTS = 1
 SIZE_HALF = 0.5

@@ -127,5 +127,22 @@ def build_strikes(rec: Recommendation, spot: float, expected_move: float,
     else:
         strikes = {}
 
+    # BUG (found after a live Tradier sandbox order 500'd): every strike
+    # above is a raw float computed from spot +/- a fraction of expected
+    # move -- e.g. 7749.508330104655. Real SPX/SPXW options only list at
+    # config.SPX_STRIKE_INCREMENT-point intervals; an OCC symbol built
+    # from an un-rounded strike (tradier_orders.occ_symbol) names a
+    # contract that doesn't exist on the exchange, and Tradier's order
+    # endpoint has no valid way to fill that -- a very plausible cause of
+    # a bare 500 with no other explanation. Round every strike to the
+    # nearest real increment before it's used for anything live (backtest
+    # P&L uses these same rounded strikes now too, for consistency --
+    # the shift versus the previously reported real-data backtest numbers
+    # should be small, since it's at most +/-2.5pts of strike placement
+    # per leg, but re-run run_backtest.py if you want the exact re-validated
+    # figure rather than assuming it's unchanged).
+    strikes = {k: round(v / config.SPX_STRIKE_INCREMENT) * config.SPX_STRIKE_INCREMENT
+               for k, v in strikes.items()}
+
     rec.strikes = strikes
     return strikes
