@@ -206,6 +206,35 @@ def main():
         range_start = range_start.replace(year=fallback_date.year, month=fallback_date.month, day=fallback_date.day)
         range_end = range_end.replace(year=fallback_date.year, month=fallback_date.month, day=fallback_date.day)
 
+    # BUG HISTORY (2026-09-09): the morning window got entered TWICE in one
+    # day (a 7:15am run and a separate 10:26am run), and because both wrote
+    # to the same state/<date>_<window>.json path, the second run silently
+    # overwrote the first's state -- the first entry's runner lot (Lot 2)
+    # was never tracked or closed by run_monitor.py again after that, and
+    # its filled Tradier order was left open/unmanaged. This has nothing to
+    # do with WHETHER a run was triggered manually or by cron -- the real
+    # bug is that nothing stopped a second entry for the same window/day
+    # regardless of trigger source. Guard it here: if a signal already
+    # exists for this exact tag (open OR already closed/.done), skip
+    # entirely rather than re-entering and clobbering it. --dry-run is
+    # exempt on purpose -- it never writes state/, so it must stay safely
+    # re-runnable any time (that's the whole point of --dry-run).
+    tag = f"{effective_date}_{window['name']}"
+    state_path = os.path.join(STATE_DIR, f"{tag}.json")
+    if not args.dry_run:
+        done_path = state_path.replace(".json", ".done")
+        existing = state_path if os.path.exists(state_path) else (done_path if os.path.exists(done_path) else None)
+        if existing:
+            status_word = "still open, being monitored" if existing == state_path else "already closed for today"
+            msg = (f"*0DTE — {tag}*: skipped -- a signal already exists for this window today "
+                   f"({status_word}). Not re-entering (this would otherwise overwrite/duplicate it). "
+                   f"If you meant to just exercise the pipeline, use --dry-run instead (never touches "
+                   f"state/); if you deliberately want to redo this window's entry, remove/rename "
+                   f"`{existing}` first.")
+            telegram_alerts.send(msg)
+            print(msg)
+            return
+
     bars = client.get_timesales("SPX", "1min", range_start.strftime("%Y-%m-%d %H:%M"),
                                  range_end.strftime("%Y-%m-%d %H:%M"))
     day_bars = (bars.get("series") or {}).get("data", [])
@@ -283,7 +312,8 @@ def main():
 
     rec = select_structure(trend_read, iv_regime, event_flag, news_risk)
 
-    tag = f"{effective_date}_{window['name']}"
+    # tag/state_path were already established above (right after
+    # effective_date), where the duplicate-entry guard lives.
     if rec.structure == Structure.NO_TRADE:
         telegram_alerts.send(f"{dry_tag}*0DTE — {tag}*: No trade. Reasons: {'; '.join(rec.reasons)}")
         print(f"No trade [{window['name']}]:", rec.reasons)
@@ -313,7 +343,6 @@ def main():
         return
 
     os.makedirs(STATE_DIR, exist_ok=True)
-    state_path = os.path.join(STATE_DIR, f"{tag}.json")
 
     # BUG HISTORY: the first live order (2026-09-09) used order_type=
     # "market" -- flagged in tradier_orders.py itself as risky for a
