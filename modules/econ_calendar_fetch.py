@@ -263,10 +263,40 @@ def fetch_bls_dates(year: int, label: str, expected_count_range: tuple[int, int]
     return dates
 
 
+
+# DECISION (2026-09-09), confirmed with the user: BLS's schedule pages
+# are blocked by an F5 BIG-IP ASM WAF -- the response body is that
+# appliance's own default "Access Denied" block page (identifiable by
+# its /apology_objects/ image reference), served even after a session/
+# cookie warmup with full browser headers. That kind of block commonly
+# triggers on the TLS handshake fingerprint itself, before BLS's server
+# ever sees an HTTP header -- meaning no amount of Python-`requests`-side
+# header/cookie tweaking is likely to ever get through it. Rather than
+# hit BLS's WAF with a doomed request every week (noisy in the Action
+# log, and impolite to a server that has explicitly said no), CPI/PPI/
+# NFP scraping is disabled by default here; econ_calendar.py's hardcoded
+# CPI_DATES_2026/PPI_DATES_2026/NFP_DATES_2026 (verified against BLS's
+# own published schedule pages via WebFetch, 2026-09-09, full year) are
+# the source of truth for these three series until BLS's block lifts or
+# this switches to a real API (FRED's release_dates endpoint covers all
+# three and was evaluated as an alternative -- skipped for now since it
+# needs a new free API key + GitHub secret; revisit if you'd rather have
+# these auto-refresh for 2027+ too). Set ATTEMPT_BLS_SCRAPE = True below
+# to re-enable trying (e.g. to periodically check whether BLS's block
+# has lifted) without reverting this file.
+ATTEMPT_BLS_SCRAPE = False
+
+
 def fetch_all(year: int) -> dict:
-    """Fetches all four series for `year`. NEVER raises -- returns
-    {"series": {name: [date,...]}, "errors": {name: "message"}}, one
-    entry per series that succeeded/failed respectively.
+    """Fetches FOMC (live scrape) and, only if ATTEMPT_BLS_SCRAPE is
+    True, CPI/PPI/NFP (also live scrape) for `year`. NEVER raises --
+    returns {"series": {name: [date,...]}, "errors": {name: "message"}},
+    one entry per series that succeeded/failed respectively. With
+    ATTEMPT_BLS_SCRAPE False (the default -- see the DECISION comment
+    above), CPI/PPI/NFP are simply not attempted; refresh_econ_calendar.py
+    then leaves whatever is already cached (or econ_calendar.py's
+    hardcoded lists) untouched for those three, which is exactly the
+    desired behavior, not a failure being silently swallowed.
 
     BUG HISTORY (2026-09-09): v1 was a plain dict comprehension, so a
     FOMC failure raised immediately and CPI/PPI/NFP were never even
@@ -274,15 +304,19 @@ def fetch_all(year: int) -> dict:
     still raised if ANY failed -- which meant that once FOMC's own
     parser got fixed and started working, its good data STILL never
     got written, because BLS's persistent 403s made the whole year
-    "fail" as a unit. Fixed for real this time: each series' success/
-    failure is independent all the way out to refresh_econ_calendar.py,
-    so a working FOMC scrape is cached even while BLS stays blocked."""
+    "fail" as a unit. v3 fixed that (each series independent), which is
+    what surfaced the real F5 ASM block page shown above -- leading to
+    this v4, which stops attempting BLS at all rather than repeatedly
+    hitting a WAF that has clearly said no."""
     series = {
         "fomc": lambda: fetch_fomc_dates(year),
-        "cpi": lambda: fetch_bls_dates(year, "Consumer Price Index", (10, 13)),
-        "ppi": lambda: fetch_bls_dates(year, "Producer Price Index", (10, 14)),
-        "nfp": lambda: fetch_bls_dates(year, "Employment Situation", (10, 13)),
     }
+    if ATTEMPT_BLS_SCRAPE:
+        series.update({
+            "cpi": lambda: fetch_bls_dates(year, "Consumer Price Index", (10, 13)),
+            "ppi": lambda: fetch_bls_dates(year, "Producer Price Index", (10, 14)),
+            "nfp": lambda: fetch_bls_dates(year, "Employment Situation", (10, 13)),
+        })
     result, errors = {}, {}
     for name, fn in series.items():
         try:
