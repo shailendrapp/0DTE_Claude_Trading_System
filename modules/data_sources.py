@@ -90,14 +90,22 @@ def parse_tradier_chain(raw_chain_json: dict) -> list[dict]:
     """
     Adapts Tradier's /markets/options/chains response into the flat
     {strike, option_type, delta, iv, open_interest, gamma} shape
-    vol_structure.py expects. UNTESTED against a live response -- this
-    sandbox has no network path to Tradier -- so treat this as a strong
-    draft: print/inspect one real response and adjust field paths here if
-    Tradier's actual shape differs (their docs describe
-    options.option[].{strike, option_type, open_interest,
-    greeks.{delta, gamma, mid_iv}}, which is what this assumes).
+    vol_structure.py expects.
+
+    CONFIRMED against a live Tradier sandbox response (2026-09-09): when
+    there's no chain for the requested expiration -- e.g. an ALREADY
+    EXPIRED 0DTE date, which --dry-run's completed-prior-day fallback
+    will always hit -- Tradier returns `{"options": null}`, not
+    `{"options": {}}`. `.get("options", {})` only substitutes its default
+    when the KEY is missing, not when the value is present and null, so
+    that crashed as `'NoneType' object has no attribute get'` (caught by
+    run_live.py's surrounding try/except, so non-fatal, but the message
+    was confusing). Fixed with `or {}` below. This is expected and
+    harmless in --dry-run mode specifically -- it just means the
+    gamma/skew context line in that run's alert has no chain to compute
+    from; it does not affect the entry decision itself.
     """
-    options = raw_chain_json.get("options", {}).get("option", [])
+    options = (raw_chain_json.get("options") or {}).get("option", [])
     if isinstance(options, dict):
         options = [options]
     out = []
