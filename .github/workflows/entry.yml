@@ -30,6 +30,11 @@ on:
         default: 'morning'
         type: choice
         options: [morning, midday, afternoon]
+      dry_run:
+        description: 'Dry run (no Tradier order, no state written) -- lets you test any time of day/week, not just after this window has closed today. See run_live.py docstring for why a non-dry-run cannot work outside market hours.'
+        required: true
+        default: true
+        type: boolean
 
 permissions:
   contents: write
@@ -71,7 +76,14 @@ jobs:
           TRADIER_SANDBOX_ACCOUNT_ID: ${{ secrets.TRADIER_SANDBOX_ACCOUNT_ID }}
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-        run: python run_live.py --window ${{ steps.window.outputs.name }}
+        # Scheduled (cron) runs are never dry-run -- only workflow_dispatch
+        # exposes that input, and only when it's explicitly set to true.
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ] && [ "${{ github.event.inputs.dry_run }}" = "true" ]; then
+            python run_live.py --window ${{ steps.window.outputs.name }} --dry-run
+          else
+            python run_live.py --window ${{ steps.window.outputs.name }}
+          fi
 
       - name: Commit any new/updated state files
         run: |

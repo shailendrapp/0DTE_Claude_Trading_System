@@ -12,6 +12,7 @@ Usage:
     python run_live.py --window morning
     python run_live.py --window midday
     python run_live.py --window afternoon
+    python run_live.py --window morning --dry-run   # any time of day/week, see below
 
 Trigger each window's cron AT OR AFTER its range closes (range_start_et +
 range_minutes in config.ENTRY_WINDOWS), never before -- running early asks
@@ -22,6 +23,22 @@ range read. With current config that's:
   afternoon: 13:30 + 15min -> trigger at/after 13:45 ET
 (An earlier version of this docstring said 09:45 for morning -- that was
 wrong for OPENING_RANGE_MINUTES=30 and has been corrected here.)
+
+WHY A NORMAL RUN CAN'T WORK "irrespective of market hours": this asks
+Tradier for real intraday bars for TODAY's window. If that window hasn't
+happened yet (e.g. it's midnight and you're asking for 9:30-10:00 AM
+bars), no data source on earth can return it -- it hasn't occurred. That
+is not a bug in this script; it would be true of any system wired to a
+real market data feed. --dry-run below is the actual fix for "I want to
+be able to run/verify this any time": if today's window hasn't closed
+yet, it transparently falls back to the most recent COMPLETED trading
+day's data for that same window, runs the full read/decision pipeline
+against it (structure selection, strikes, sizing, the Telegram context +
+entry alert), and prints/sends it clearly marked "[DRY RUN]" -- but does
+NOT submit any Tradier order and does NOT write a state/ file, so it can
+never interfere with a real signal or pollute the P&L log. It proves the
+pipeline is wired correctly end to end; it does not (and cannot) prove
+what today's actual data will produce, because that doesn't exist yet.
 
 Required env vars:
   TRADIER_TOKEN, TRADIER_SANDBOX_ACCOUNT_ID
@@ -90,9 +107,25 @@ def count_open_signals_today(today: dt.date) -> int:
     return count
 
 
+def most_recent_completed_weekday(before: dt.date) -> dt.date:
+    """Approximation used only by --dry-run: the prior weekday, with no
+    market-holiday calendar behind it (same caveat as pnl_log.py's
+    is_last_trading_day_of_month). Good enough for "give me SOME real
+    completed session to test against"; not a claim that it was actually
+    a trading day."""
+    d = before - dt.timedelta(days=1)
+    while d.weekday() >= 5:
+        d -= dt.timedelta(days=1)
+    return d
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--window", required=True, help="Entry window name, e.g. morning/midday/afternoon (see config.ENTRY_WINDOWS)")
+    ap.add_argument("--dry-run", action="store_true",
+                     help="Exercise the full pipeline without submitting Tradier orders or writing "
+                          "state/pnl_log. If today's window hasn't closed yet, falls back to the most "
+                          "recent completed trading day so this can run any time. See module docstring.")
     args = ap.parse_args()
     window = get_window(args.window)
 
@@ -123,15 +156,30 @@ def main():
     h, m = (int(x) for x in window["range_start_et"].split(":"))
     range_start = now_et.replace(hour=h, minute=m, second=0, microsecond=0)
     range_end = range_start + dt.timedelta(minutes=window["range_minutes"])
+
+    effective_date = today  # the date whose window we're actually reading
+    if args.dry_run and now_et < range_end:
+        fallback_date = most_recent_completed_weekday(today)
+        print(f"[dry-run] {today}'s {window['name']} window closes at "
+              f"{range_end.strftime('%H:%M %Z')} but it's currently {now_et.strftime('%H:%M %Z')} -- "
+              f"using {fallback_date} instead so this can be exercised any time. "
+              f"(No market-holiday calendar behind this -- see most_recent_completed_weekday().)")
+        effective_date = fallback_date
+        range_start = range_start.replace(year=fallback_date.year, month=fallback_date.month, day=fallback_date.day)
+        range_end = range_end.replace(year=fallback_date.year, month=fallback_date.month, day=fallback_date.day)
+
     bars = client.get_timesales("SPX", "1min", range_start.strftime("%Y-%m-%d %H:%M"),
                                  range_end.strftime("%Y-%m-%d %H:%M"))
     day_bars = (bars.get("series") or {}).get("data", [])
     if isinstance(day_bars, dict):  # Tradier returns a bare dict, not a list, for a single bar
         day_bars = [day_bars]
     if not day_bars:
+        reason = ("that date may not have been a real trading day (holiday/weekend edge case in "
+                   "the no-calendar fallback above)" if args.dry_run else
+                   "check market is open and this isn't being run before the window's range has "
+                   "actually elapsed")
         raise SystemExit(f"No bars returned for window '{window['name']}' "
-                          f"({range_start}-{range_end}) -- check market is open and this "
-                          f"isn't being run before the window's range has actually elapsed.")
+                          f"({range_start}-{range_end}) -- {reason}.")
     highs = [float(b["high"]) for b in day_bars]
     lows = [float(b["low"]) for b in day_bars]
     em = expected_move(spot, vix, 1.0 / config.TRADING_DAYS_PER_YEAR)
@@ -144,8 +192,11 @@ def main():
     news_risk = score_risk(headlines, overnight_futures_gap_pct=0.0, overnight_vix_change_pct=0.0)  # wire real gap/vix-change inputs
 
     # ---- Market structure / vol structure / composite score, for the Telegram context alert ----
+    # Uses effective_date (== today, except in a --dry-run fallback) so the
+    # daily lookback lines up with whichever session's intraday bars we
+    # actually fetched above.
     daily_hist = client.get_history("SPX", "daily",
-                                     (today - dt.timedelta(days=40)).isoformat(), today.isoformat())
+                                     (effective_date - dt.timedelta(days=40)).isoformat(), effective_date.isoformat())
     daily_bars_raw = daily_hist.get("history", {}).get("day", [])
     daily_bars = [{"high": float(b["high"]), "low": float(b["low"]), "close": float(b["close"])}
                   for b in daily_bars_raw]
@@ -153,7 +204,7 @@ def main():
     prior_bar = daily_bars[-1] if daily_bars else {"high": spot, "low": spot, "close": spot}
 
     vix_hist = client.get_history("VIX", "daily",
-                                   (today - dt.timedelta(days=5)).isoformat(), today.isoformat())
+                                   (effective_date - dt.timedelta(days=5)).isoformat(), effective_date.isoformat())
     vix_bars_raw = vix_hist.get("history", {}).get("day", [])
     vix_prior_close = float(vix_bars_raw[-1]["close"]) if vix_bars_raw else vix
 
@@ -169,7 +220,7 @@ def main():
 
     chain = []
     try:
-        raw_chain = client.get_option_chain("SPXW", today.isoformat())
+        raw_chain = client.get_option_chain("SPXW", effective_date.isoformat())
         chain = parse_tradier_chain(raw_chain)
     except Exception as e:  # noqa: BLE001
         print(f"[warning] couldn't fetch/parse option chain for gamma/skew context: {e}")
@@ -183,13 +234,15 @@ def main():
                                      event_is_blocking=should_delay_entry(event_flag),
                                      news_score=news_risk.score)
 
-    telegram_alerts.send(telegram_alerts.format_context_alert(window["name"], ms, vs, score))
+    dry_tag = "[DRY RUN] " if args.dry_run else ""
+    context_msg = telegram_alerts.format_context_alert(window["name"], ms, vs, score)
+    telegram_alerts.send(dry_tag + context_msg if args.dry_run else context_msg)
 
     rec = select_structure(trend_read, iv_regime, event_flag, news_risk)
 
-    tag = f"{today}_{window['name']}"
+    tag = f"{effective_date}_{window['name']}"
     if rec.structure == Structure.NO_TRADE:
-        telegram_alerts.send(f"*0DTE — {tag}*: No trade. Reasons: {'; '.join(rec.reasons)}")
+        telegram_alerts.send(f"{dry_tag}*0DTE — {tag}*: No trade. Reasons: {'; '.join(rec.reasons)}")
         print(f"No trade [{window['name']}]:", rec.reasons)
         return
 
@@ -198,10 +251,24 @@ def main():
     theo_credit = theoretical_net_credit(strikes, spot, vix)
     entry_credit_per_contract = theo_credit * config.FILL_HAIRCUT  # expected, NOT guaranteed -- see actual fill via order response
 
-    expiration = today  # 0DTE
+    expiration = effective_date  # 0DTE
 
     signal = build_daily_signal(tag, rec.structure.value, strikes,
                                  total_contracts, entry_credit_per_contract)
+
+    entry_msg = f"{dry_tag}[{window['name']}]\n" + telegram_alerts.format_entry_alert(signal)
+
+    if args.dry_run:
+        # No order, no state file, no pnl_log row -- this run proved the
+        # pipeline computes a structure/strikes/sizing end to end; it must
+        # never look like (or interfere with) a real signal.
+        telegram_alerts.send(entry_msg)
+        print(f"[dry-run][{window['name']}] Would have entered {rec.structure.value} "
+              f"(effective_date={effective_date}) -- no order submitted, no state written.")
+        print(json.dumps({"structure": rec.structure.value, "strikes": strikes,
+                           "total_contracts": total_contracts,
+                           "entry_credit_per_contract": round(entry_credit_per_contract, 2)}, indent=2))
+        return
 
     os.makedirs(STATE_DIR, exist_ok=True)
     state_path = os.path.join(STATE_DIR, f"{tag}.json")
@@ -217,7 +284,7 @@ def main():
     with open(state_path, "w") as f:
         f.write(signal.to_json())
 
-    telegram_alerts.send(f"[{window['name']}]\n" + telegram_alerts.format_entry_alert(signal))
+    telegram_alerts.send(entry_msg)
     print(f"[{window['name']}] Entered {rec.structure.value}, state saved to {state_path}")
     print(json.dumps(order_results, indent=2))
 
