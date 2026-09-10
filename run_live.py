@@ -65,8 +65,9 @@ from modules.econ_calendar import check_event, should_delay_entry, load_calendar
 from modules.news_geopolitical import fetch_headlines, score_news_risk
 from modules.strategy_selector import select_structure, build_strikes, Structure
 from modules.option_pricer import expected_move, bs_price
-from modules.position_manager import build_daily_signal
-from modules.tradier_orders import build_entry_legs, submit_multileg_order, get_order_status
+from modules.position_manager import build_daily_signal, LotStatus
+from modules.tradier_orders import (build_entry_legs, submit_multileg_order, get_order_status,
+                                     get_spread_credit_to_open)
 from modules.market_structure import build_market_structure
 from modules.vol_structure import build_vol_structure
 from modules.scoring import compute_composite_score
@@ -337,10 +338,47 @@ def main():
 
     strikes = build_strikes(rec, spot, em, trend_read)
     total_contracts = max(config.NUM_LOTS, round(config.BASE_CONTRACTS * config.NUM_LOTS * rec.size_multiplier))
-    theo_credit = theoretical_net_credit(strikes, spot, vix)
-    entry_credit_per_contract = theo_credit * config.FILL_HAIRCUT  # expected, NOT guaranteed -- see actual fill via order response
-
     expiration = effective_date  # 0DTE
+
+    theo_credit = theoretical_net_credit(strikes, spot, vix)
+    # BUG HISTORY (2026-09-10): this used to be the ONLY pricing basis --
+    # entry_credit_per_contract and the limit price were both set off
+    # theo_credit (Black-Scholes) * config.FILL_HAIRCUT. That's what caused
+    # the 2026-09-10 morning entry to be priced ~28x the real market for a
+    # wide/deep-OTM iron condor (BS said $12.79 theoretical / $6.40 after
+    # haircut; the real market, confirmed via an OptionStrat screenshot AND
+    # the Tradier sandbox order sitting unfilled all day, was $0.45 total).
+    # A flat haircut can't correct for a gap that scales with strike
+    # distance. Fix: ask Tradier for real bid/ask quotes on these exact
+    # legs (get_spread_credit_to_open(), same pattern run_monitor.py
+    # already uses on the closing side via get_spread_debit_to_close()) and
+    # use THAT as the pricing basis instead. theo_credit is kept as a
+    # fallback only -- if the live quote call fails outright, or the chain
+    # returns something degenerate (<=0 credit, e.g. no quotes yet on an
+    # illiquid leg), fall back to theoretical*haircut rather than trade on
+    # a KeyError/exception, but log loudly either way so a fallback is
+    # visible, not silent.
+    try:
+        market_credit = get_spread_credit_to_open(client, strikes, expiration)
+    except Exception as e:  # noqa: BLE001
+        print(f"[warning] couldn't fetch real market entry credit ({e}) -- falling back to "
+              f"theoretical*haircut estimate (${theo_credit * config.FILL_HAIRCUT:.2f}).")
+        market_credit = None
+
+    if market_credit is None or market_credit <= 0.0:
+        if market_credit is not None:  # fetched fine, just degenerate
+            print(f"[warning] real-market entry credit quoted as ${market_credit:.2f} (<=0) -- "
+                  f"falling back to theoretical*haircut estimate (${theo_credit * config.FILL_HAIRCUT:.2f}). "
+                  f"This can happen if the chain is illiquid/has no quotes yet -- double check before "
+                  f"trusting size on a fallback-priced entry.")
+        pricing_credit = theo_credit * config.FILL_HAIRCUT
+    else:
+        pricing_credit = market_credit
+        ratio = f"{market_credit / theo_credit:.1%}" if theo_credit > 0 else "n/a"
+        print(f"[pricing] theoretical (BS) credit=${theo_credit:.2f}, real market credit=${market_credit:.2f} "
+              f"(market is {ratio} of theoretical) -- using real market credit as the pricing basis.")
+
+    entry_credit_per_contract = pricing_credit  # expected, NOT guaranteed -- see actual fill via order response
 
     signal = build_daily_signal(tag, rec.structure.value, strikes,
                                  total_contracts, entry_credit_per_contract)
@@ -371,7 +409,13 @@ def main():
     # computed against reality, not a guess, whenever a fill is
     # confirmed in time. See poll_for_fill()'s docstring for the
     # fallback behavior when it isn't.
-    limit_price = round(theo_credit * config.ENTRY_LIMIT_PRICE_FRACTION, 2) \
+    # BUG HISTORY (2026-09-10): this used to be theo_credit (Black-Scholes)
+    # -- now priced off pricing_credit (real market quote, falling back to
+    # theoretical*haircut only if the quote call failed/degenerated -- see
+    # above), so the limit order is grounded in what the market is actually
+    # showing rather than a theoretical model that badly overprices wide/
+    # deep-OTM 0DTE structures.
+    limit_price = round(pricing_credit * config.ENTRY_LIMIT_PRICE_FRACTION, 2) \
         if config.ENTRY_ORDER_TYPE != "market" else None
 
     order_results = []
@@ -382,6 +426,7 @@ def main():
         result = submit_multileg_order(client, account_id, "SPXW", lot_legs,
                                         order_type=config.ENTRY_ORDER_TYPE, price=limit_price)
         order_id = (result.get("order") or {}).get("id")
+        lot.order_id = order_id  # needed for run_monitor.py to reconcile a still-pending fill later
 
         filled_credit, was_filled = (lot.entry_credit_per_contract, False)
         if order_id is not None:
@@ -391,11 +436,28 @@ def main():
             print(f"[warning] order submission response for lot {lot.lot_index} had no order id -- "
                   f"can't poll for fill, using pre-trade estimate. Raw response: {result}")
 
+        # BUG HISTORY (2026-09-10): a lot that never got a confirmed fill
+        # used to stay at its default status=OPEN with the pre-trade
+        # theoretical credit recorded as if it were real -- a phantom
+        # position. run_monitor.py would then try to "exit" it at hard
+        # EOD, which (since nothing was actually opened) would have
+        # submitted a brand-new position in the opposite direction rather
+        # than closing anything. Root-caused to a real trade (2026-09-10
+        # morning, a wide/deep-OTM iron condor) where the limit price was
+        # ~28x the real market credit and so sat open, unfilled, all day.
+        # Lots that don't confirm filled here are now PENDING_FILL, not
+        # OPEN -- check_lot_exit() already skips anything that isn't OPEN,
+        # and run_monitor.py separately reconciles PENDING_FILL lots (polls
+        # for a late fill; cancels the order and marks it cancelled_unfilled
+        # once hard EOD passes) rather than treating them as exitable.
         if was_filled:
             lot.entry_credit_per_contract = filled_credit
+        else:
+            lot.status = LotStatus.PENDING_FILL
 
         order_results.append({"lot": lot.lot_index, "order": result,
                                "limit_price": limit_price, "confirmed_filled": was_filled,
+                               "status": lot.status.value,
                                "recorded_entry_credit_per_contract": lot.entry_credit_per_contract})
 
     with open(state_path, "w") as f:

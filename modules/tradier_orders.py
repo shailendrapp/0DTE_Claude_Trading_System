@@ -138,6 +138,24 @@ def get_order_status(client: TradierClient, account_id: str, order_id) -> dict:
     return r.json()
 
 
+def cancel_order(client: TradierClient, account_id: str, order_id) -> dict:
+    """DELETE /accounts/{account_id}/orders/{order_id} -- cancels a still-
+    open (unfilled) order. Used by run_monitor.py when an entry limit order
+    never got a confirmed fill and it's time to give up on it (hard EOD, or
+    an explicit reconciliation pass) rather than leave a stale day-order
+    sitting in the account indefinitely. Tradier no-ops harmlessly if the
+    order already filled/cancelled/expired by the time this runs -- treat
+    a non-ok response as informational, not fatal, since the caller's next
+    step (marking the lot cancelled_unfilled) is correct either way."""
+    import requests
+    r = requests.delete(f"{client.base_url}/accounts/{account_id}/orders/{order_id}",
+                         headers=client._headers(), timeout=10)
+    if not r.ok:
+        print(f"[Tradier {r.status_code}] DELETE /accounts/{account_id}/orders/{order_id}\n"
+              f"Response body: {r.text}")
+    return {"status_code": r.status_code, "ok": r.ok, "body": r.text}
+
+
 def get_spread_debit_to_close(client: TradierClient, strikes: dict, expiration: dt.date,
                                underlying: str = "SPXW") -> float:
     """Quotes each leg and returns the net debit (per contract) to close the
@@ -148,6 +166,59 @@ def get_spread_debit_to_close(client: TradierClient, strikes: dict, expiration: 
     opening ones)."""
     symbols = []
     signs = []  # +1 = we are buying to close (pay), -1 = selling to close (receive)
+    if "call_short" in strikes:
+        symbols.append(occ_symbol(underlying, expiration, strikes["call_short"], True)); signs.append(+1)
+    if "call_long" in strikes:
+        symbols.append(occ_symbol(underlying, expiration, strikes["call_long"], True)); signs.append(-1)
+    if "put_short" in strikes:
+        symbols.append(occ_symbol(underlying, expiration, strikes["put_short"], False)); signs.append(+1)
+    if "put_long" in strikes:
+        symbols.append(occ_symbol(underlying, expiration, strikes["put_long"], False)); signs.append(-1)
+
+    quote = client.get_quote(",".join(symbols))
+    quotes = quote["quotes"]["quote"]
+    if isinstance(quotes, dict):
+        quotes = [quotes]
+    by_symbol = {q["symbol"]: q for q in quotes}
+
+    net = 0.0
+    for sym, sign in zip(symbols, signs):
+        q = by_symbol[sym]
+        mid = (float(q["bid"]) + float(q["ask"])) / 2.0
+        net += sign * mid
+    return max(0.0, net)
+
+
+def get_spread_credit_to_open(client: TradierClient, strikes: dict, expiration: dt.date,
+                               underlying: str = "SPXW") -> float:
+    """Real-market-quote equivalent of get_spread_debit_to_close(), but for
+    the OPENING side. Quotes each leg and returns the net credit (per
+    contract) actually available to open the position right now.
+
+    BUG HISTORY (2026-09-10): run_live.py used to set the entry limit price
+    off theoretical_net_credit() (Black-Scholes), then apply a flat
+    config.FILL_HAIRCUT to approximate the real/theoretical gap. That's
+    fine for near-the-money structures, but for a wide, deep-OTM 0DTE
+    structure (a real trade that day: SPX iron condor, 85pt wings) it was
+    catastrophically wrong -- BS priced the tail risk at $12.79 theoretical
+    (-> $6.40 after the 0.5 haircut), while the real market (confirmed via
+    an OptionStrat screenshot AND the Tradier sandbox order sitting
+    unfilled all day at that price) was quoting a combined $0.45 credit for
+    the same strikes. The gap isn't a fixed percentage -- it grows sharply
+    with strike distance, so no single FILL_HAIRCUT constant can correct
+    for it across all structures. The fix: stop guessing from BS and ask
+    Tradier what the market actually is, exactly like get_spread_debit_to_
+    close() already does for exits. Mid price per leg, same as that
+    function -- real fills will differ (usually worse, since mid isn't
+    guaranteed), which is exactly why ENTRY_LIMIT_PRICE_FRACTION still
+    applies on top of whatever this returns, same as before.
+
+    Sign convention (opposite of get_spread_debit_to_close, since these are
+    the entry-side legs): +1 for sell_to_open legs (short strikes, credit
+    received), -1 for buy_to_open legs (long strikes, debit paid).
+    """
+    symbols = []
+    signs = []
     if "call_short" in strikes:
         symbols.append(occ_symbol(underlying, expiration, strikes["call_short"], True)); signs.append(+1)
     if "call_long" in strikes:
