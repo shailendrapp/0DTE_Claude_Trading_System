@@ -167,6 +167,22 @@ def main():
     args = ap.parse_args()
     window = get_window(args.window)
 
+    # Startup heartbeat -- sent BEFORE any Tradier/env-var validation below,
+    # so a manual "Run workflow" restart (or every scheduled fire, per your
+    # choice -- this alert fires on ALL of them, not just manual triggers)
+    # gets an immediate Telegram confirmation the engine actually started,
+    # independent of whether anything downstream succeeds or fails. GITHUB_
+    # EVENT_NAME is a default env var GitHub Actions sets on every step
+    # (workflow_dispatch for a manual run, schedule for cron) -- no workflow
+    # YAML change needed to see it here.
+    trigger_source = os.environ.get("GITHUB_EVENT_NAME", "local/manual")
+    startup_time = dt.datetime.now(ET).strftime("%Y-%m-%d %H:%M %Z")
+    startup_msg = (f"🟢 *0DTE Engine started* — window: {window['name']}, "
+                   f"mode: {'DRY RUN' if args.dry_run else 'LIVE'}, trigger: {trigger_source}, "
+                   f"{startup_time}")
+    telegram_alerts.send(startup_msg)
+    print(startup_msg)
+
     token = os.environ.get("TRADIER_TOKEN")
     account_id = os.environ.get("TRADIER_SANDBOX_ACCOUNT_ID")
     if not token or not account_id:
