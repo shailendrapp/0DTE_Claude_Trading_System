@@ -80,7 +80,14 @@ def format_entry_alert(signal) -> str:
              f"Strikes: `{signal.strikes}`", ""]
     for lot in signal.lots:
         target = f"{lot.profit_target_fraction:.0%} target" if lot.profit_target_fraction else "runner (ratcheting stop)"
-        lines.append(f"Lot {lot.lot_index} — {lot.contracts}x @ ${lot.entry_credit_per_contract:.2f} credit — {target}")
+        # BUG HISTORY (2026-09-10): a lot whose limit order never got a
+        # confirmed fill used to show here with the pre-trade theoretical
+        # credit and no indication it wasn't real -- looked identical to
+        # a genuinely filled lot. It's now status=PENDING_FILL (see
+        # position_manager.py), so flag it plainly instead of implying a
+        # real position exists at that price.
+        pending_note = " -- ⚠️ NOT YET FILLED, order still working" if lot.status.value == "pending_fill" else ""
+        lines.append(f"Lot {lot.lot_index} — {lot.contracts}x @ ${lot.entry_credit_per_contract:.2f} credit — {target}{pending_note}")
     lines.append(f"\nHard EOD close: {signal.hard_eod_exit_et} ET")
     return "\n".join(lines)
 

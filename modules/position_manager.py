@@ -17,11 +17,27 @@ import config
 
 
 class LotStatus(str, Enum):
+    # BUG HISTORY (2026-09-10): a limit-order entry that never got a
+    # confirmed fill was still recorded with the default OPEN status and
+    # the pre-trade theoretical credit -- a phantom position. run_monitor.py
+    # would then try to "exit" it at hard EOD, which (since no real
+    # position exists) would actually have opened a brand-new, unintended
+    # position in the opposite direction rather than closing anything.
+    # Root cause surfaced by a real trade (2026-09-10 morning): the limit
+    # price was ~28x the real market credit for that wide/deep-OTM
+    # structure (a Black-Scholes-vs-real-market gap far beyond what
+    # config.FILL_HAIRCUT corrects for), so it sat open all day. PENDING_
+    # FILL is a new, explicit "not yet a real position" state distinct
+    # from OPEN, so it's never treated as something to exit; CANCELLED_
+    # UNFILLED is its terminal resting state once run_monitor.py gives up
+    # on it (see run_monitor.py's reconcile_pending_lot()).
+    PENDING_FILL = "pending_fill"
     OPEN = "open"
     CLOSED_PROFIT_TARGET = "closed_profit_target"
     CLOSED_STOP_LOSS = "closed_stop_loss"
     CLOSED_STRIKE_TEST = "closed_strike_test"
     CLOSED_EOD = "closed_eod"
+    CANCELLED_UNFILLED = "cancelled_unfilled"
 
 
 @dataclass
@@ -35,6 +51,8 @@ class Lot:
     exit_price_per_contract: Optional[float] = None
     exit_reason: Optional[str] = None
     exit_time: Optional[str] = None
+    order_id: Optional[int] = None  # the entry order's Tradier id -- needed to
+    # re-poll a PENDING_FILL lot's status later, or cancel it, in run_monitor.py
 
     @property
     def is_runner(self) -> bool:
@@ -107,6 +125,25 @@ def current_stop_level(signal: DailySignal, lot: Lot) -> float:
 def _within_market_hours_before_hard_exit(now_et: datetime, hard_exit_str: str) -> bool:
     h, m = (int(x) for x in hard_exit_str.split(":"))
     return now_et.time() < dt_time(h, m)
+
+
+def past_hard_eod(signal: DailySignal, now_et: datetime) -> bool:
+    """Public wrapper so callers outside this module (run_monitor.py's
+    PENDING_FILL reconciliation) can reuse the exact same hard-EOD check
+    check_lot_exit uses internally, instead of re-deriving it."""
+    return not _within_market_hours_before_hard_exit(now_et, signal.hard_eod_exit_et)
+
+
+# Lot statuses that mean "not yet resolved, still needs monitor.py attention"
+# -- OPEN (a real filled position, needs exit-condition checks) and
+# PENDING_FILL (an entry order that hasn't been confirmed filled yet, needs
+# reconciliation -- see run_monitor.py's reconcile_pending_lot()). Anything
+# else (CLOSED_*, CANCELLED_UNFILLED) is terminal for that lot.
+ACTIVE_STATUSES = (LotStatus.OPEN, LotStatus.PENDING_FILL)
+
+
+def is_terminal(lot: Lot) -> bool:
+    return lot.status not in ACTIVE_STATUSES
 
 
 def check_lot_exit(signal: DailySignal, lot: Lot, current_debit_to_close_per_contract: float,

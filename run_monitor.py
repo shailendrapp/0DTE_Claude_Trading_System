@@ -28,8 +28,10 @@ import zoneinfo
 
 import config
 from modules.data_sources import TradierClient
-from modules.position_manager import DailySignal, check_lot_exit, apply_exit, lot_pnl, signal_summary, LotStatus
-from modules.tradier_orders import build_exit_legs, submit_multileg_order, get_spread_debit_to_close
+from modules.position_manager import (DailySignal, check_lot_exit, apply_exit, lot_pnl, signal_summary,
+                                       LotStatus, past_hard_eod, is_terminal)
+from modules.tradier_orders import (build_exit_legs, submit_multileg_order, get_spread_debit_to_close,
+                                     get_order_status, cancel_order)
 from modules import telegram_alerts, pnl_log
 
 ET = zoneinfo.ZoneInfo("America/New_York")
@@ -40,20 +42,102 @@ def open_state_paths_today(today: dt.date) -> list[str]:
     return sorted(glob.glob(os.path.join(STATE_DIR, f"{today}_*.json")))
 
 
+def reconcile_pending_lot(client: TradierClient, account_id: str, signal: DailySignal,
+                           lot, now_et: dt.datetime) -> bool:
+    """A PENDING_FILL lot's entry order never confirmed filled within
+    run_live.py's short poll window (see that module's BUG HISTORY comment,
+    2026-09-10). This is where it eventually gets resolved -- checked every
+    monitor run until either a real fill shows up or hard EOD arrives.
+    Returns True if the lot's status changed (caller should persist state).
+
+    - No order_id at all (submission itself didn't return one) -> nothing
+      to track or cancel; treat as never having existed.
+    - Order now shows filled -> promote to OPEN with the real fill price
+      (or, if the status says filled but no price field is found, still
+      promote to OPEN using the pre-trade estimate rather than leave a
+      real position untracked -- log it loudly either way).
+    - Order rejected/canceled/expired on Tradier's side already -> mark
+      cancelled, nothing to do.
+    - Still genuinely pending and hard EOD has passed -> actively cancel
+      the day order (don't just let it silently expire unseen) and mark
+      cancelled_unfilled.
+    - Still pending and still before hard EOD -> leave it, try again next
+      run (a limit order may yet fill later in the session)."""
+    if lot.order_id is None:
+        print(f"[{signal.date}] Lot {lot.lot_index} has no order_id to reconcile -- "
+              f"treating as never-entered.")
+        lot.status = LotStatus.CANCELLED_UNFILLED
+        lot.exit_reason = "no_order_id"
+        lot.exit_time = now_et.isoformat()
+        return True
+
+    try:
+        status = get_order_status(client, account_id, lot.order_id)
+        order = status.get("order", status)
+        state = (order.get("status") or "").lower()
+    except Exception as e:  # noqa: BLE001
+        print(f"[{signal.date}] Lot {lot.lot_index}: couldn't poll order {lot.order_id} status "
+              f"({e}) -- leaving PENDING_FILL, will retry next run.")
+        return False
+
+    if state == "filled":
+        fill = order.get("avg_fill_price")
+        if fill is not None:
+            lot.entry_credit_per_contract = float(fill)
+        else:
+            print(f"[{signal.date}] Lot {lot.lot_index}: order {lot.order_id} shows filled but no "
+                  f"avg_fill_price -- promoting to OPEN with the pre-trade estimate anyway "
+                  f"(a real position exists and MUST be tracked for exit, even with an imperfect credit number).")
+        lot.status = LotStatus.OPEN
+        print(f"[{signal.date}] Lot {lot.lot_index}: order {lot.order_id} confirmed filled "
+              f"(late) at ${lot.entry_credit_per_contract:.2f}/contract -- now OPEN.")
+        return True
+
+    if state in ("rejected", "canceled", "cancelled", "expired"):
+        lot.status = LotStatus.CANCELLED_UNFILLED
+        lot.exit_reason = f"order_{state}"
+        lot.exit_time = now_et.isoformat()
+        print(f"[{signal.date}] Lot {lot.lot_index}: order {lot.order_id} ended '{state}' -- "
+              f"marking cancelled_unfilled.")
+        return True
+
+    # Still genuinely open/pending on Tradier's side.
+    if past_hard_eod(signal, now_et):
+        cancel_result = cancel_order(client, account_id, lot.order_id)
+        lot.status = LotStatus.CANCELLED_UNFILLED
+        lot.exit_reason = "never_filled_cancelled_at_eod"
+        lot.exit_time = now_et.isoformat()
+        print(f"[{signal.date}] Lot {lot.lot_index}: order {lot.order_id} never filled and hard "
+              f"EOD has passed -- cancelled (result: {cancel_result}), marking cancelled_unfilled.")
+        return True
+
+    return False  # still pending, still before hard EOD -- leave it, retry next run
+
+
 def process_one(client: TradierClient, account_id: str, state_path: str, now_et: dt.datetime) -> None:
     with open(state_path) as f:
         signal = DailySignal.from_json(f.read())
 
-    if all(lot.status != LotStatus.OPEN for lot in signal.lots):
+    if all(is_terminal(lot) for lot in signal.lots):
         # Shouldn't normally happen (should already be .done), but be safe.
         os.rename(state_path, state_path.replace(".json", ".done"))
         return
+
+    any_change = False
+
+    # Reconcile any PENDING_FILL lots FIRST, in the same run -- a lot that
+    # gets promoted to OPEN here (a late real fill) is then immediately
+    # eligible for the normal exit-condition check right below, in this
+    # same pass, rather than waiting an extra ~5min monitor cycle.
+    for lot in signal.lots:
+        if lot.status == LotStatus.PENDING_FILL:
+            if reconcile_pending_lot(client, account_id, signal, lot, now_et):
+                any_change = True
 
     expiration = now_et.date()  # 0DTE
     underlying_price = float(client.get_quote("SPX")["quotes"]["quote"]["last"])
     debit_to_close = get_spread_debit_to_close(client, signal.strikes, expiration)
 
-    any_change = False
     for lot in signal.lots:
         if lot.status != LotStatus.OPEN:
             continue
@@ -83,7 +167,13 @@ def process_one(client: TradierClient, account_id: str, state_path: str, now_et:
         with open(state_path, "w") as f:
             f.write(signal.to_json())
 
-    if all(lot.status != LotStatus.OPEN for lot in signal.lots):
+    # BUG HISTORY (2026-09-10): this used to be `!= OPEN`, which treated a
+    # still-unresolved PENDING_FILL lot as "done" the moment it existed
+    # (since PENDING_FILL != OPEN too) -- prematurely sending the EOD
+    # summary/renaming to .done while an entry order was genuinely still
+    # working. is_terminal() correctly excludes PENDING_FILL, so a signal
+    # only wraps up once every lot is truly resolved one way or another.
+    if all(is_terminal(lot) for lot in signal.lots):
         summary = signal_summary(signal)
         telegram_alerts.send(telegram_alerts.format_eod_summary(signal, summary))
         # signal.date is "<YYYY-MM-DD>_<window_name>" (see run_live.py's
