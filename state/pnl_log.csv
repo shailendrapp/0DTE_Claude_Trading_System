@@ -15,3 +15,5 @@ date,window,structure,total_pnl,n_lots
 2026-09-15,midday,balanced_iron_condor,0.0,3
 2026-09-15,morning,balanced_iron_condor,0.0,3
 2026-09-16,morning,balanced_iron_condor,-2392.5,3
+2026-09-16,afternoon,call_credit_spread,0.0,3
+2026-09-16,midday,call_credit_spread,0.0,3
