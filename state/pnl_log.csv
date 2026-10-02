@@ -51,3 +51,5 @@ date,window,structure,total_pnl,n_lots
 2026-10-01,afternoon,balanced_iron_condor,0.0,3
 2026-10-01,midday,put_credit_spread,0.0,3
 2026-10-02,morning,balanced_iron_condor,-455.0,3
+2026-10-02,afternoon,balanced_iron_condor,0.0,3
+2026-10-02,midday,balanced_iron_condor,0.0,3
